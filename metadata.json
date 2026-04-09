@@ -1,0 +1,5 @@
+{
+  "name": "CHUYỂN VĂN BẢN THÀNH GIỌNG NÓI ĐA SỬA PITCH",
+  "description": "Generate high-quality, natural-sounding speech from text using Google's Gemini API. Customize voices, speed, and pitch, with full support for SSML for advanced control.",
+  "requestFramePermissions": []
+}
