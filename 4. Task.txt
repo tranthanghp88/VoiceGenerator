@@ -1,1 +1,65 @@
-1. Ẩn Preset mặc định của Voice ngoài Panel chính 
+=== TÓM TẮT TASK AUTO UPDATE (CHUYỂN CHAT MỚI) ===
+
+MỤC TIÊU:
+- Fix auto update Electron mượt (không hiện installer)
+- Flow: Check → Download → Install → Restart app
+- Version tiếp theo: 2.0.3
+
+---
+
+TRẠNG THÁI HIỆN TẠI:
+- Đã build 2.0.2
+- Update đang:
+  ❌ báo lỗi GitHub (đã fix gần xong)
+  ❌ hoặc hiện installer (chưa đúng flow)
+- Git vừa setup lại
+- Đã có .gitignore chuẩn
+
+---
+
+VIỆC CẦN LÀM Ở CHAT MỚI:
+
+1. Fix auto update chuẩn
+2. Đảm bảo:
+   - không hiện installer
+   - auto restart app
+3. Build version mới: 2.0.3
+
+---
+
+FILE CẦN GỬI (QUAN TRỌNG):
+
+1. package.json
+2. electron/main.cjs
+3. electron/preload.cjs
+4. AboutPanel.tsx
+
+---
+
+YÊU CẦU XỬ LÝ (QUAN TRỌNG):
+
+- SỬA TRỰC TIẾP
+- GỬI LẠI FILE FULL
+- KHÔNG GIẢI THÍCH DÀI
+- MỖI LẦN CHỈ 1 FILE (đúng flow trước đó)
+- ĐẢM BẢO CHẠY ĐƯỢC NGAY
+
+---
+
+NOTE:
+
+- Không rebuild 2.0.2
+- Làm luôn 2.0.3
+- Sau khi fix xong → build:
+  npm run dist:publish
+
+---
+
+KẾT QUẢ MONG MUỐN:
+
+App update như:
+→ Discord / Chrome
+→ không popup installer
+→ chỉ loading + restart
+
+=== END ===
