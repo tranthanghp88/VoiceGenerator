@@ -862,7 +862,7 @@ export default function App() {
     <div className="mx-auto max-w-7xl p-4 md:p-5">
       <div className="mb-4 flex justify-center">
         <h1 className="select-none text-center text-2xl font-bold tracking-tight text-slate-800">
-          VOICE GENERATOR
+          ENGLISH VOICE GENERATOR
         </h1>
       </div>
 

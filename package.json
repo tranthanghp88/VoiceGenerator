@@ -1,11 +1,11 @@
 {
     "name":  "english-voice-generator",
     "private":  true,
-    "version":  "2.0.3",
+    "version":  "2.0.4",
     "description":  "Voice Generator",
     "main":  "electron/main.cjs",
     "type":  "module",
-    "author":  "Tráº§n VÄƒn Tháº¯ng",
+    "author":  "TrÃ¡ÂºÂ§n VÃ„Æ’n ThÃ¡ÂºÂ¯ng",
     "scripts":  {
                     "dev":  "vite",
                     "server":  "node server/index.mjs",

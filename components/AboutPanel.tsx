@@ -172,7 +172,7 @@ export default function AboutPanel({ showAbout, setShowAbout }: AboutPanelProps)
 
         {showAbout && (
           <div className="absolute bottom-10 right-0 w-96 bg-white border p-4 rounded-xl shadow-xl">
-            <div className="font-semibold">Voice Generator</div>
+            <div className="font-semibold">English Voice Generator</div>
             <div className="text-xs mt-2">Create by Trần Văn Thắng</div>
 
             <div className="flex items-center justify-between text-xs mt-2 gap-3">
