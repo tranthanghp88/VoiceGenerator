@@ -12,6 +12,7 @@ const APP_TITLE = "English Voice Generator";
 let mainWindow = null;
 let backendProcess = null;
 let backendStartingPromise = null;
+let installTriggered = false;
 let updateState = {
   checking: false,
   available: false,
@@ -19,12 +20,13 @@ let updateState = {
   downloaded: false,
   percent: 0,
   version: "",
-  error: ""
+  error: "",
+  message: ""
 };
 
-function sendUpdateStatus() {
+function sendUpdateStatus(extra = {}) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send("update-status", { ...updateState });
+  mainWindow.webContents.send("update-status", { ...updateState, ...extra });
 }
 
 function getLogFilePath() {
@@ -289,11 +291,21 @@ async function createMainWindow() {
   return mainWindow;
 }
 
-
 autoUpdater.autoDownload = false;
-autoUpdater.autoInstallOnAppQuit = true;
+autoUpdater.autoInstallOnAppQuit = false;
+autoUpdater.disableWebInstaller = true;
+autoUpdater.allowPrerelease = false;
+autoUpdater.allowDowngrade = false;
+autoUpdater.logger = {
+  info: (message) => log(`[updater] ${message}`),
+  warn: (message) => log(`[updater:warn] ${message}`),
+  error: (message) => log(`[updater:error] ${message}`),
+  debug: (message) => log(`[updater:debug] ${message}`)
+};
 
 autoUpdater.on("checking-for-update", () => {
+  log("Updater: checking-for-update");
+  installTriggered = false;
   updateState = {
     ...updateState,
     checking: true,
@@ -301,12 +313,14 @@ autoUpdater.on("checking-for-update", () => {
     downloading: false,
     downloaded: false,
     percent: 0,
-    error: ""
+    error: "",
+    message: "Đang kiểm tra cập nhật..."
   };
   sendUpdateStatus();
 });
 
 autoUpdater.on("update-available", (info) => {
+  log(`Updater: update-available version=${String(info?.version || "")}`);
   updateState = {
     ...updateState,
     checking: false,
@@ -315,12 +329,14 @@ autoUpdater.on("update-available", (info) => {
     downloaded: false,
     percent: 0,
     version: String(info?.version || ""),
-    error: ""
+    error: "",
+    message: "Đã có bản cập nhật mới. Bắt đầu tải..."
   };
   sendUpdateStatus();
 });
 
-autoUpdater.on("update-not-available", () => {
+autoUpdater.on("update-not-available", (info) => {
+  log(`Updater: update-not-available current=${app.getVersion()} latest=${String(info?.version || "")}`);
   updateState = {
     ...updateState,
     checking: false,
@@ -328,25 +344,29 @@ autoUpdater.on("update-not-available", () => {
     downloading: false,
     downloaded: false,
     percent: 0,
-    error: ""
+    error: "",
+    message: "Không có bản cập nhật mới"
   };
   sendUpdateStatus();
 });
 
 autoUpdater.on("download-progress", (progressObj) => {
+  const percent = Number(progressObj?.percent || 0);
   updateState = {
     ...updateState,
     checking: false,
     available: true,
     downloading: true,
     downloaded: false,
-    percent: Number(progressObj?.percent || 0),
-    error: ""
+    percent,
+    error: "",
+    message: `Đang tải cập nhật... ${Math.round(percent)}%`
   };
   sendUpdateStatus();
 });
 
 autoUpdater.on("update-downloaded", (info) => {
+  log(`Updater: update-downloaded version=${String(info?.version || "")}`);
   updateState = {
     ...updateState,
     checking: false,
@@ -355,17 +375,23 @@ autoUpdater.on("update-downloaded", (info) => {
     downloaded: true,
     percent: 100,
     version: String(info?.version || updateState.version || ""),
-    error: ""
+    error: "",
+    message: "Tải xong. Đang cài đặt và khởi động lại..."
   };
-  sendUpdateStatus();
+  sendUpdateStatus({ installNow: true });
 });
 
 autoUpdater.on("error", (error) => {
+  const message = error?.message || String(error || "Update error");
+  log(`Updater error: ${message}`);
   updateState = {
     ...updateState,
     checking: false,
+    available: false,
     downloading: false,
-    error: error?.message || String(error || "Update error")
+    downloaded: false,
+    error: message,
+    message
   };
   sendUpdateStatus();
 });
@@ -387,9 +413,6 @@ if (!gotLock) {
 
     try {
       await createMainWindow();
-      setTimeout(() => {
-        autoUpdater.checkForUpdates().catch(() => {});
-      }, 3000);
     } catch (error) {
       log(`second-instance create window error: ${error?.message || String(error)}`);
     }
@@ -432,23 +455,26 @@ if (!gotLock) {
   });
 }
 
-
 ipcMain.handle("app:get-version", async () => {
   return app.getVersion();
 });
 
 ipcMain.handle("app:check-for-updates", async () => {
   try {
+    installTriggered = false;
     await autoUpdater.checkForUpdates();
     return { ok: true };
   } catch (error) {
+    const message = error?.message || String(error || "Check update failed");
+    log(`checkForUpdates failed: ${message}`);
     updateState = {
       ...updateState,
       checking: false,
-      error: error?.message || String(error || "Check update failed")
+      error: message,
+      message
     };
     sendUpdateStatus();
-    return { ok: false, error: updateState.error };
+    return { ok: false, error: message };
   }
 });
 
@@ -457,21 +483,50 @@ ipcMain.handle("app:download-update", async () => {
     await autoUpdater.downloadUpdate();
     return { ok: true };
   } catch (error) {
+    const message = error?.message || String(error || "Download update failed");
+    log(`downloadUpdate failed: ${message}`);
     updateState = {
       ...updateState,
       downloading: false,
-      error: error?.message || String(error || "Download update failed")
+      error: message,
+      message
     };
     sendUpdateStatus();
-    return { ok: false, error: updateState.error };
+    return { ok: false, error: message };
   }
 });
 
 ipcMain.handle("app:quit-and-install-update", async () => {
-  setImmediate(() => {
-    autoUpdater.quitAndInstall(false, true);
-  });
-  return { ok: true };
+  try {
+    if (installTriggered) return { ok: true };
+
+    installTriggered = true;
+    updateState = {
+      ...updateState,
+      checking: false,
+      available: true,
+      downloading: false,
+      downloaded: true,
+      percent: 100,
+      error: "",
+      message: "Đang cài đặt bản cập nhật..."
+    };
+    sendUpdateStatus();
+
+    setTimeout(() => {
+      try {
+        autoUpdater.quitAndInstall(true, true);
+      } catch (error) {
+        log(`quitAndInstall failed: ${error?.message || String(error)}`);
+      }
+    }, 400);
+
+    return { ok: true };
+  } catch (error) {
+    const message = error?.message || String(error || "Quit and install failed");
+    log(`quit-and-install-update failed: ${message}`);
+    return { ok: false, error: message };
+  }
 });
 
 ipcMain.handle("app:get-update-status", async () => {
@@ -519,193 +574,52 @@ ipcMain.handle("file:saveAudioFile", async (_event, payload = {}) => {
       return { ok: false, error: "Thiếu arrayBuffer" };
     }
 
-    fs.mkdirSync(folderPath, { recursive: true });
-
-    const fullPath = path.join(folderPath, fileName);
     const buffer = Buffer.from(arrayBuffer);
+    fs.mkdirSync(folderPath, { recursive: true });
+    const outputPath = path.join(folderPath, fileName);
+    fs.writeFileSync(outputPath, buffer);
 
-    fs.writeFileSync(fullPath, buffer);
-
-    return {
-      ok: true,
-      path: fullPath
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error?.message || String(error)
-    };
-  }
-});
-
-ipcMain.handle("file:readTextFile", async (_event, filePath) => {
-  try {
-    const text = fs.readFileSync(String(filePath || ""), "utf8");
-    return { ok: true, text };
+    return { ok: true, path: outputPath };
   } catch (error) {
     return { ok: false, error: error?.message || String(error) };
   }
 });
 
-ipcMain.handle("file:writeTextFile", async (_event, payload = {}) => {
-  try {
-    const filePath = String(payload.filePath || "");
-    const text = String(payload.text || "");
-
-    if (!filePath) {
-      return { ok: false, error: "Thiếu filePath" };
-    }
-
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, text, "utf8");
-
-    return { ok: true, filePath };
-  } catch (error) {
-    return { ok: false, error: error?.message || String(error) };
-  }
-});
-
-ipcMain.handle("file:exists", async (_event, filePath) => {
-  try {
-    return {
-      ok: true,
-      exists: fs.existsSync(String(filePath || ""))
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      exists: false,
-      error: error?.message || String(error)
-    };
-  }
-});
-
-ipcMain.handle("file:rename", async (_event, payload = {}) => {
-  try {
-    const oldPath = String(payload.oldPath || "");
-    const newPath = String(payload.newPath || "");
-
-    if (!oldPath || !newPath) {
-      return { ok: false, error: "Thiếu oldPath hoặc newPath" };
-    }
-
-    fs.mkdirSync(path.dirname(newPath), { recursive: true });
-    fs.renameSync(oldPath, newPath);
-
-    return { ok: true, newPath };
-  } catch (error) {
-    return { ok: false, error: error?.message || String(error) };
-  }
-});
-
-ipcMain.handle("fs:list-audio-files", async (_event, payload = {}) => {
+ipcMain.handle("file:list-audio-files", async (_event, payload = {}) => {
   try {
     const folderPath = String(payload.folderPath || "");
-    if (!folderPath) {
-      return { ok: false, error: "Thiếu folderPath", files: [] };
+    if (!folderPath || !fs.existsSync(folderPath)) {
+      return { ok: true, files: [] };
     }
 
-    if (!fs.existsSync(folderPath)) {
-      return { ok: false, error: "Thư mục không tồn tại", files: [] };
-    }
-
-    const entries = fs.readdirSync(folderPath, { withFileTypes: true });
-
-    const files = entries
+    const files = fs
+      .readdirSync(folderPath, { withFileTypes: true })
       .filter((entry) => entry.isFile())
-      .map((entry) => {
-        const fullPath = path.join(folderPath, entry.name);
-        const stat = fs.statSync(fullPath);
+      .map((entry) => entry.name);
 
-        return {
-          name: entry.name,
-          path: fullPath,
-          size: stat.size,
-          modifiedAt: stat.mtime.toISOString()
-        };
-      })
-      .filter((item) => /\.(wav|mp3|m4a|ogg)$/i.test(item.name))
-      .sort((a, b) => {
-        return new Date(b.modifiedAt).getTime() - new Date(a.modifiedAt).getTime();
-      });
-
-    return {
-      ok: true,
-      files
-    };
+    return { ok: true, files };
   } catch (error) {
-    return {
-      ok: false,
-      error: error?.message || String(error),
-      files: []
-    };
+    return { ok: false, error: error?.message || String(error), files: [] };
   }
 });
 
-ipcMain.handle("fs:read-audio-file", async (_event, payload = {}) => {
+ipcMain.handle("file:read-audio-file", async (_event, payload = {}) => {
   try {
     const filePath = String(payload.filePath || "");
-    if (!filePath) {
-      return { ok: false, error: "Thiếu filePath" };
-    }
-
-    if (!fs.existsSync(filePath)) {
-      return { ok: false, error: "File không tồn tại" };
+    if (!filePath || !fs.existsSync(filePath)) {
+      return { ok: false, error: "Không tìm thấy file" };
     }
 
     const buffer = fs.readFileSync(filePath);
-    const ext = path.extname(filePath).toLowerCase();
-
-    let mimeType = "application/octet-stream";
-    if (ext === ".wav") mimeType = "audio/wav";
-    else if (ext === ".mp3") mimeType = "audio/mpeg";
-    else if (ext === ".m4a") mimeType = "audio/mp4";
-    else if (ext === ".ogg") mimeType = "audio/ogg";
-
     return {
       ok: true,
-      name: path.basename(filePath),
-      path: filePath,
-      mimeType,
-      data: buffer.toString("base64")
+      fileName: path.basename(filePath),
+      arrayBuffer: buffer.buffer.slice(
+        buffer.byteOffset,
+        buffer.byteOffset + buffer.byteLength
+      )
     };
   } catch (error) {
-    return {
-      ok: false,
-      error: error?.message || String(error)
-    };
-  }
-});
-
-ipcMain.handle("fs:save-audio-file", async (_event, payload = {}) => {
-  try {
-    const fileName = String(payload.fileName || "output.wav");
-    const folderPath = String(payload.folderPath || "");
-    const arrayBuffer = payload.arrayBuffer;
-
-    if (!folderPath) {
-      return { ok: false, error: "Thiếu folderPath" };
-    }
-
-    if (!arrayBuffer) {
-      return { ok: false, error: "Thiếu arrayBuffer" };
-    }
-
-    fs.mkdirSync(folderPath, { recursive: true });
-
-    const fullPath = path.join(folderPath, fileName);
-    const buffer = Buffer.from(arrayBuffer);
-
-    fs.writeFileSync(fullPath, buffer);
-
-    return {
-      ok: true,
-      path: fullPath
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error?.message || String(error)
-    };
+    return { ok: false, error: error?.message || String(error) };
   }
 });

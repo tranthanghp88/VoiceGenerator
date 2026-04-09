@@ -1,5 +1,18 @@
-Property 'getVersion' does not exist on type '{ isDesktop?: boolean | undefined; platform?: string | undefined; selectFolder?: (() => Promise<{ canceled: boolean; path: string; }>) | undefined; saveAudioFile?: ((payload: { folderPath: string; fileName: string; arrayBuffer: ArrayBuffer; }) => Promise<...>) | undefined; listAudioFiles?: ((payload: { ...; }) => Pr...'.
-Property 'onUpdateStatus' does not exist on type '{ isDesktop?: boolean | undefined; platform?: string | undefined; selectFolder?: (() => Promise<{ canceled: boolean; path: string; }>) | undefined; saveAudioFile?: ((payload: { folderPath: string; fileName: string; arrayBuffer: ArrayBuffer; }) => Promise<...>) | undefined; listAudioFiles?: ((payload: { ...; }) => Pr...'.
-Property 'quitAndInstallUpdate' does not exist on type '{ isDesktop?: boolean | undefined; platform?: string | undefined; selectFolder?: (() => Promise<{ canceled: boolean; path: string; }>) | undefined; saveAudioFile?: ((payload: { folderPath: string; fileName: string; arrayBuffer: ArrayBuffer; }) => Promise<...>) | undefined; listAudioFiles?: ((payload: { ...; }) => Pr...'.
-Property 'downloadUpdate' does not exist on type '{ isDesktop?: boolean | undefined; platform?: string | undefined; selectFolder?: (() => Promise<{ canceled: boolean; path: string; }>) | undefined; saveAudioFile?: ((payload: { folderPath: string; fileName: string; arrayBuffer: ArrayBuffer; }) => Promise<...>) | undefined; listAudioFiles?: ((payload: { ...; }) => Pr...'.
-Property 'checkForUpdates' does not exist on type '{ isDesktop?: boolean | undefined; platform?: string | undefined; selectFolder?: (() => Promise<{ canceled: boolean; path: string; }>) | undefined; saveAudioFile?: ((payload: { folderPath: string; fileName: string; arrayBuffer: ArrayBuffer; }) => Promise<...>) | undefined; listAudioFiles?: ((payload: { ...; }) => Pr...'.
+✓ 60 modules transformed.
+dist/index.html                  0.86 kB │ gzip:   0.46 kB
+dist/assets/index-qslDgrDn.js  373.75 kB │ gzip: 108.73 kB
+✓ built in 1.24s
+  • electron-builder  version=26.8.1 os=10.0.22621
+  • loaded configuration  file=package.json ("build" field)
+  • writing effective config  file=release\builder-effective-config.yaml
+  • executing @electron/rebuild  electronVersion=40.8.5 arch=x64 buildFromSource=false workspaceRoot=C:\Users\TRAN PHUONG\Desktop\007 projectDir=./ appDir=./
+  • installing native dependencies  arch=x64
+  ⨯ Unexpected token '﻿', "﻿{
+    "n"... is not valid JSON  failedTask=build stackTrace=SyntaxError: Unexpected token '﻿', "﻿{
+    "n"... is not valid JSON
+    at JSON.parse (<anonymous>)
+    at readPackageJson (file:///C:/Users/TRAN%20PHUONG/Desktop/007/node_modules/@electron/rebuild/lib/read-package-json.js:6:21)
+    at async ModuleWalker.walkModules (file:///C:/Users/TRAN%20PHUONG/Desktop/007/node_modules/@electron/rebuild/lib/module-walker.js:31:33)
+    at async Rebuilder.modulesToRebuild (file:///C:/Users/TRAN%20PHUONG/Desktop/007/node_modules/@electron/rebuild/lib/rebuild.js:106:9)
+    at async Rebuilder.rebuild (file:///C:/Users/TRAN%20PHUONG/Desktop/007/node_modules/@electron/rebuild/lib/rebuild.js:92:34)
+Loi build/publish
