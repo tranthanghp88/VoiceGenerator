@@ -5,7 +5,7 @@
     "description":  "Voice Generator",
     "main":  "electron/main.cjs",
     "type":  "module",
-    "author":  "Trần Văn Thắng",
+    "author":  "Tráº§n VÄƒn Tháº¯ng",
     "scripts":  {
                     "dev":  "vite",
                     "server":  "node server/index.mjs",
