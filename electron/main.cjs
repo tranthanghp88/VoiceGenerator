@@ -1,46 +1,15 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
-const { autoUpdater } = require("electron-updater");
+const { app, BrowserWindow, ipcMain, dialog } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const { spawn } = require("child_process");
 const net = require("net");
-const http = require("http");
 
 const APP_TITLE = "English Voice Generator";
 const isDev = !app.isPackaged;
 
-const gotSingleInstanceLock = app.requestSingleInstanceLock();
-if (!gotSingleInstanceLock) {
-  app.quit();
-  process.exit(0);
-}
-
 let mainWindow = null;
 let backendProcess = null;
-let installTriggered = false;
-let backendStartingPromise = null;
-
-let updateState = {
-  checking: false,
-  available: false,
-  downloading: false,
-  downloaded: false,
-  percent: 0,
-  version: "",
-  error: "",
-  message: ""
-};
-
-function sendUpdateStatus(extra = {}) {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send("update-status", { ...updateState, ...extra });
-}
-
-function logUpdater(message) {
-  log(`[updater] ${message}`);
-}
-
 
 function log(message) {
   const line = `[${new Date().toISOString()}] [main] ${message}`;
@@ -65,11 +34,23 @@ function getRendererUrl() {
 }
 
 function getRendererFile() {
-  return path.join(getProjectRoot(), "dist", "index.html");
+  const candidates = [
+    path.join(getProjectRoot(), "dist", "index.html"),
+    path.join(process.resourcesPath || "", "app.asar.unpacked", "dist", "index.html"),
+    path.join(process.resourcesPath || "", "dist", "index.html")
+  ].filter(Boolean);
+  return candidates.find((p) => fs.existsSync(p)) || candidates[0];
 }
 
 function getServerEntry() {
-  return path.join(getProjectRoot(), "server", "index.mjs");
+  const appPath = typeof app.getAppPath === "function" ? app.getAppPath() : "";
+  const candidates = [
+    path.join(getProjectRoot(), "server", "index.mjs"),
+    path.join(appPath, "server", "index.mjs"),
+    path.join(process.resourcesPath || "", "app.asar.unpacked", "server", "index.mjs"),
+    path.join(process.resourcesPath || "", "server", "index.mjs")
+  ].filter(Boolean);
+  return candidates.find((p) => fs.existsSync(p)) || candidates[0];
 }
 
 function ensureNumber(value, fallback = 0) {
@@ -119,41 +100,6 @@ function isPortInUse(port, host = "127.0.0.1") {
     socket.once("error", () => done(false));
     socket.connect(port, host);
   });
-}
-
-
-function probeBackendApi(host = "127.0.0.1", port = 3030, endpoint = "/api/key-stats") {
-  return new Promise((resolve) => {
-    const req = http.get(
-      {
-        host,
-        port,
-        path: endpoint,
-        timeout: 1200
-      },
-      (res) => {
-        const ok = res.statusCode && res.statusCode >= 200 && res.statusCode < 500;
-        res.resume();
-        resolve(Boolean(ok));
-      }
-    );
-
-    req.on("timeout", () => {
-      req.destroy();
-      resolve(false);
-    });
-
-    req.on("error", () => resolve(false));
-  });
-}
-
-async function waitForBackendApi(host = "127.0.0.1", port = 3030, attempts = 24, delayMs = 250) {
-  for (let i = 0; i < attempts; i += 1) {
-    const ok = await probeBackendApi(host, port);
-    if (ok) return true;
-    await wait(delayMs);
-  }
-  return false;
 }
 
 function getUserDataDir() {
@@ -340,7 +286,6 @@ function drawRoundedRectRgb(frame, width, height, x, y, w, h, radius = 9999, rgb
   for (let yy = y0; yy < y1; yy += 1) {
     for (let xx = x0; xx < x1; xx += 1) {
       let inside = false;
-
       if (r <= 0) {
         inside = true;
       } else if (xx >= x0 + r && xx < x1 - r) {
@@ -354,7 +299,6 @@ function drawRoundedRectRgb(frame, width, height, x, y, w, h, radius = 9999, rgb
         const dy = yy - cy;
         inside = (dx * dx + dy * dy) <= (r * r);
       }
-
       if (inside) {
         const idx = (yy * width + xx) * 3;
         frame[idx] = rgb[0];
@@ -367,8 +311,8 @@ function drawRoundedRectRgb(frame, width, height, x, y, w, h, radius = 9999, rgb
 
 async function renderCustomBarsVideo(wavPath, outPath, durationSeconds, options = {}) {
   const { samples, sampleRate } = readMono16WavSamples(wavPath);
-  const width = Math.max(120, ensureNumber(options.width, 860));
-  const height = Math.max(60, ensureNumber(options.height, 140));
+  const width = Math.max(120, ensureNumber(options.width, 560));
+  const height = Math.max(60, ensureNumber(options.height, 44));
   const fps = Math.max(12, ensureNumber(options.fps, 24));
   const barCount = Math.max(24, ensureNumber(options.barCount, 72));
   const barWidth = Math.max(2, ensureNumber(options.barWidth, 4));
@@ -386,7 +330,6 @@ async function renderCustomBarsVideo(wavPath, outPath, durationSeconds, options 
   const smoothingUp = Math.max(0.01, Math.min(1, ensureNumber(options.smoothingUp, 0.28)));
   const smoothingDown = Math.max(0.01, Math.min(1, ensureNumber(options.smoothingDown, 0.22)));
   const borderRadius = Math.max(0, ensureNumber(options.borderRadius, 9999));
-
   const sampleWindow = Math.max(64, Math.round(sampleRate * (smoothWindowMs / 1000)));
   const historySamples = Math.max(sampleWindow * 2, Math.round(sampleRate * historySeconds));
   const totalFrames = Math.max(1, Math.ceil(durationSeconds * fps));
@@ -502,20 +445,14 @@ async function startBackend() {
     const host = process.env.HOST || "127.0.0.1";
     const port = Number(process.env.PORT || 3030);
 
-    const alreadyHealthy = await probeBackendApi(host, port);
-    if (alreadyHealthy) {
-      log(`Backend API already responding at http://${host}:${port}, skip spawn.`);
-      return;
-    }
-
     const alreadyRunning = await isPortInUse(port, host);
     if (alreadyRunning) {
-      log(`Port ${host}:${port} is already in use but backend API is not responding. Skip spawn to avoid duplicate/conflict.`);
+      log(`Backend already running at http://${host}:${port}, skip spawn.`);
       return;
     }
 
     const serverEntry = getServerEntry();
-    if (!fs.existsSync(serverEntry)) {
+    if (!serverEntry || !fs.existsSync(serverEntry)) {
       log(`server entry not found: ${serverEntry}`);
       return;
     }
@@ -527,7 +464,7 @@ async function startBackend() {
     log(`serverEntry = ${serverEntry}`);
 
     backendProcess = spawn(process.execPath, [serverEntry], {
-      cwd: getProjectRoot(),
+      cwd: path.dirname(serverEntry),
       env: {
         ...process.env,
         PORT: process.env.PORT || "3030",
@@ -548,10 +485,8 @@ async function startBackend() {
       if (msg) log(`[server:error] ${msg}`);
     });
 
-    backendProcess.on("error", (error) => {
-      const message = error?.message || String(error || "Unknown backend spawn error");
-      log(`backend spawn error: ${message}`);
-      backendProcess = null;
+    backendProcess.on("error", (err) => {
+      log(`backend spawn error: ${err?.message || String(err)}`);
     });
 
     backendProcess.on("exit", (code, signal) => {
@@ -559,13 +494,8 @@ async function startBackend() {
       backendProcess = null;
     });
 
-    const ready = await waitForBackendApi(host, port, 24, 250);
-    if (ready) {
-      log(`Backend ready at http://${host}:${port}`);
-      return;
-    }
-
-    log(`Backend failed to become ready at http://${host}:${port}`);
+    const ready = await waitForBackendApi(host, port, 40, 250);
+    log(ready ? `Backend ready at http://${host}:${port}` : `Backend did not become ready at http://${host}:${port}`);
   })();
 
   try {
@@ -584,7 +514,7 @@ function stopBackend() {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1360,
+    width: 1400,
     height: 900,
     minWidth: 1200,
     minHeight: 760,
@@ -605,11 +535,7 @@ function createWindow() {
     mainWindow.loadFile(getRendererFile());
   }
 
-    mainWindow.webContents.on("did-finish-load", () => {
-    sendUpdateStatus();
-  });
-
-mainWindow.on("closed", () => {
+  mainWindow.on("closed", () => {
     mainWindow = null;
   });
 }
@@ -761,84 +687,6 @@ async function composeFinalMediaFiles(payload = {}) {
   };
 }
 
-ipcMain.handle("app:get-version", async () => {
-  return app.getVersion();
-});
-
-ipcMain.handle("app:get-update-status", async () => {
-  return { ...updateState };
-});
-
-ipcMain.handle("app:check-for-updates", async () => {
-  try {
-    installTriggered = false;
-    logUpdater("checkForUpdates() called from renderer");
-    await autoUpdater.checkForUpdates();
-    return { ok: true };
-  } catch (error) {
-    const message = error?.message || String(error || "Check update failed");
-    updateState = {
-      ...updateState,
-      checking: false,
-      error: message,
-      message
-    };
-    logUpdater(`checkForUpdates failed: ${message}`);
-    sendUpdateStatus();
-    return { ok: false, error: message };
-  }
-});
-
-ipcMain.handle("app:download-update", async () => {
-  try {
-    logUpdater("downloadUpdate() called from renderer");
-    await autoUpdater.downloadUpdate();
-    return { ok: true };
-  } catch (error) {
-    const message = error?.message || String(error || "Download update failed");
-    updateState = {
-      ...updateState,
-      downloading: false,
-      error: message,
-      message
-    };
-    logUpdater(`downloadUpdate failed: ${message}`);
-    sendUpdateStatus();
-    return { ok: false, error: message };
-  }
-});
-
-ipcMain.handle("app:quit-and-install-update", async () => {
-  try {
-    if (installTriggered) return { ok: true };
-    installTriggered = true;
-    updateState = {
-      ...updateState,
-      checking: false,
-      available: true,
-      downloading: false,
-      downloaded: true,
-      percent: 100,
-      error: "",
-      message: "Đang cài đặt bản cập nhật..."
-    };
-    logUpdater("quitAndInstall() requested");
-    sendUpdateStatus();
-    setTimeout(() => {
-      try {
-        autoUpdater.quitAndInstall(false, true);
-      } catch (error) {
-        logUpdater(`quitAndInstall failed: ${error?.message || String(error)}`);
-      }
-    }, 500);
-    return { ok: true };
-  } catch (error) {
-    const message = error?.message || String(error || "Quit and install failed");
-    logUpdater(`quit-and-install-update failed: ${message}`);
-    return { ok: false, error: message };
-  }
-});
-
 ipcMain.handle("dialog:select-folder", async () => {
   const result = await dialog.showOpenDialog({
     title: APP_TITLE,
@@ -911,38 +759,6 @@ ipcMain.handle("file:save-audio", async (_event, payload = {}) => {
     return { ok: true, path: targetPath };
   } catch (error) {
     return { ok: false, error: error?.message || String(error) };
-  }
-});
-
-ipcMain.handle("file:open-folder-path", async (_event, payload = {}) => {
-  try {
-    const targetPath = safeText(payload.path);
-    if (!targetPath) return { ok: false, error: "Thiếu đường dẫn để mở." };
-
-    let folderPath = targetPath;
-    if (fs.existsSync(targetPath)) {
-      try {
-        const stat = fs.statSync(targetPath);
-        if (stat.isFile()) {
-          folderPath = path.dirname(targetPath);
-        }
-      } catch {}
-    } else {
-      folderPath = path.dirname(targetPath);
-    }
-
-    if (!folderPath || !fs.existsSync(folderPath)) {
-      return { ok: false, error: "Không tìm thấy thư mục cần mở." };
-    }
-
-    const result = await shell.openPath(folderPath);
-    if (result) {
-      return { ok: false, error: result };
-    }
-
-    return { ok: true, path: folderPath };
-  } catch (error) {
-    return { ok: false, error: error?.message || String(error || "Không thể mở thư mục") };
   }
 });
 
@@ -1065,116 +881,6 @@ ipcMain.handle("file:delete-bgm-asset", async (_event, payload = {}) => {
   } catch (error) {
     return { ok: false, error: error?.message || String(error) };
   }
-});
-
-
-autoUpdater.autoDownload = false;
-autoUpdater.autoInstallOnAppQuit = false;
-
-autoUpdater.on("checking-for-update", () => {
-  installTriggered = false;
-  updateState = {
-    ...updateState,
-    checking: true,
-    available: false,
-    downloading: false,
-    downloaded: false,
-    percent: 0,
-    error: "",
-    message: "Đang kiểm tra cập nhật..."
-  };
-  logUpdater("checking-for-update");
-  sendUpdateStatus();
-});
-
-autoUpdater.on("update-available", (info) => {
-  const version = String(info?.version || "");
-  updateState = {
-    ...updateState,
-    checking: false,
-    available: true,
-    downloading: false,
-    downloaded: false,
-    percent: 0,
-    version,
-    error: "",
-    message: `Đã có bản cập nhật mới${version ? ` (${version})` : ""}`
-  };
-  logUpdater(`update-available version=${version}`);
-  sendUpdateStatus();
-});
-
-autoUpdater.on("update-not-available", (info) => {
-  const version = String(info?.version || app.getVersion() || "");
-  updateState = {
-    ...updateState,
-    checking: false,
-    available: false,
-    downloading: false,
-    downloaded: false,
-    percent: 0,
-    version,
-    error: "",
-    message: "Không có bản cập nhật mới"
-  };
-  logUpdater(`update-not-available version=${version}`);
-  sendUpdateStatus();
-});
-
-autoUpdater.on("download-progress", (progressObj) => {
-  const percent = Number(progressObj?.percent || 0);
-  updateState = {
-    ...updateState,
-    checking: false,
-    available: true,
-    downloading: true,
-    downloaded: false,
-    percent,
-    error: "",
-    message: `Đang tải cập nhật... ${Math.round(percent)}%`
-  };
-  logUpdater(`download-progress percent=${percent.toFixed(2)}`);
-  sendUpdateStatus();
-});
-
-autoUpdater.on("update-downloaded", (info) => {
-  const version = String(info?.version || updateState.version || "");
-  updateState = {
-    ...updateState,
-    checking: false,
-    available: true,
-    downloading: false,
-    downloaded: true,
-    percent: 100,
-    version,
-    error: "",
-    message: "Tải xong. Đang cài đặt và khởi động lại..."
-  };
-  logUpdater(`update-downloaded version=${version}`);
-  sendUpdateStatus({ installNow: true });
-});
-
-autoUpdater.on("error", (error) => {
-  const message = error?.message || String(error || "Update error");
-  updateState = {
-    ...updateState,
-    checking: false,
-    available: false,
-    downloading: false,
-    downloaded: false,
-    error: message,
-    message
-  };
-  logUpdater(`error ${message}`);
-  sendUpdateStatus();
-});
-
-
-app.on("second-instance", () => {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  if (mainWindow.isMinimized()) mainWindow.restore();
-  mainWindow.show();
-  mainWindow.focus();
 });
 
 app.whenReady().then(async () => {
