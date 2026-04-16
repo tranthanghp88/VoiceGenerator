@@ -29,7 +29,14 @@ function getProjectRoot() {
 }
 
 function getPreloadPath() {
-  return path.join(__dirname, "preload.cjs");
+  const appPath = typeof app.getAppPath === "function" ? app.getAppPath() : "";
+  const candidates = [
+    path.join(__dirname, "preload.cjs"),
+    path.join(appPath, "electron", "preload.cjs"),
+    path.join(process.resourcesPath || "", "app.asar.unpacked", "electron", "preload.cjs"),
+    path.join(process.resourcesPath || "", "electron", "preload.cjs")
+  ].filter(Boolean);
+  return candidates.find((p) => fs.existsSync(p)) || candidates[0];
 }
 
 function getRendererUrl() {
@@ -37,11 +44,25 @@ function getRendererUrl() {
 }
 
 function getRendererFile() {
-  return path.join(getProjectRoot(), "dist", "index.html");
+  const appPath = typeof app.getAppPath === "function" ? app.getAppPath() : "";
+  const candidates = [
+    path.join(getProjectRoot(), "dist", "index.html"),
+    path.join(appPath, "dist", "index.html"),
+    path.join(process.resourcesPath || "", "app.asar.unpacked", "dist", "index.html"),
+    path.join(process.resourcesPath || "", "dist", "index.html")
+  ].filter(Boolean);
+  return candidates.find((p) => fs.existsSync(p)) || candidates[0];
 }
 
 function getServerEntry() {
-  return path.join(getProjectRoot(), "server", "index.mjs");
+  const appPath = typeof app.getAppPath === "function" ? app.getAppPath() : "";
+  const candidates = [
+    path.join(getProjectRoot(), "server", "index.mjs"),
+    path.join(appPath, "server", "index.mjs"),
+    path.join(process.resourcesPath || "", "app.asar.unpacked", "server", "index.mjs"),
+    path.join(process.resourcesPath || "", "server", "index.mjs")
+  ].filter(Boolean);
+  return candidates.find((p) => fs.existsSync(p)) || candidates[0];
 }
 
 function ensureNumber(value, fallback = 0) {
@@ -92,8 +113,6 @@ function isPortInUse(port, host = "127.0.0.1") {
     socket.connect(port, host);
   });
 }
-
-
 
 async function waitForBackendApi(host, port, attempts = 40, delayMs = 250) {
   for (let i = 0; i < attempts; i += 1) {
@@ -378,11 +397,9 @@ async function renderCustomBarsVideo(wavPath, outPath, durationSeconds, options 
 }
 
 
-
 async function startBackend() {
   if (backendStartingPromise) return backendStartingPromise;
   if (backendProcess && !backendProcess.killed) return;
-  if (!isDev && backendModuleLoaded) return;
 
   backendStartingPromise = (async () => {
     const host = process.env.HOST || "127.0.0.1";
@@ -403,19 +420,14 @@ async function startBackend() {
       return;
     }
 
-    log("APP STARTING...");
-    log("startBackend()");
-    log(`isDev = ${String(isDev)}`);
-    log(`command = ${process.execPath}`);
-    log(`serverEntry = ${serverEntry}`);
-
     if (isDev) {
+      log("APP STARTING DEV BACKEND...");
       backendProcess = spawn(process.execPath, [serverEntry], {
         cwd: path.dirname(serverEntry),
         env: {
           ...process.env,
-          PORT: String(port),
-          HOST: host,
+          PORT: process.env.PORT || "3030",
+          HOST: process.env.HOST || "127.0.0.1",
           ELECTRON_RUN_AS_NODE: "1"
         },
         windowsHide: true,
@@ -441,25 +453,19 @@ async function startBackend() {
         backendProcess = null;
       });
     } else {
-      try {
-        process.env.PORT = String(port);
-        process.env.HOST = host;
-        const serverUrl = pathToFileURL(serverEntry).href;
-        await import(serverUrl);
+      if (backendModuleLoaded) {
+        log("backend module already loaded in process.");
+      } else {
+        log("APP STARTING PRODUCTION BACKEND VIA IMPORT...");
+        process.env.PORT = process.env.PORT || "3030";
+        process.env.HOST = process.env.HOST || "127.0.0.1";
+        await import(pathToFileURL(serverEntry).href);
         backendModuleLoaded = true;
-        log("[server] loaded in-process via dynamic import");
-      } catch (err) {
-        log(`[server:error] import failed: ${err?.stack || err?.message || String(err)}`);
-        throw err;
       }
     }
 
     const ready = await waitForBackendApi(host, port, 40, 250);
-    if (ready) {
-      log(`Backend ready at http://${host}:${port}`);
-    } else {
-      log(`Backend failed to become ready at http://${host}:${port}`);
-    }
+    log(ready ? `Backend ready at http://${host}:${port}` : `Backend failed to become ready at http://${host}:${port}`);
   })();
 
   try {
@@ -468,7 +474,6 @@ async function startBackend() {
     backendStartingPromise = null;
   }
 }
-
 
 function stopBackend() {
   if (backendProcess && !backendProcess.killed) {
@@ -604,7 +609,7 @@ async function composeFinalMediaFiles(payload = {}) {
     "-filter_complex",
     `[0:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720[bg];` +
     `[2:v]colorkey=0x000000:0.12:0.02[wave];` +
-    `[bg][wave]overlay=x=360:y=500:format=auto[vout]`,
+    `[bg][wave]overlay=x=(W-w)/2+20:y=590:format=auto[vout]`,
     "-map", "[vout]",
     "-map", "1:a",
     "-c:v", "libx264",
