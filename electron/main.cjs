@@ -496,15 +496,28 @@ async function startBackend() {
     if (msg) log(`[server:error] ${msg}`);
   });
 
+  backendProcess.on("error", (error) => {
+    const message = error?.message || String(error || "Unknown backend spawn error");
+    log(`backend spawn error: ${message}`);
+    backendProcess = null;
+  });
+
   backendProcess.on("exit", (code, signal) => {
     log(`backend exited code=${code} signal=${signal}`);
     backendProcess = null;
   });
 
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 20; i += 1) {
     await wait(250);
+    const ok = await isPortInUse(port, host);
+    if (ok) {
+      log(`Backend ready at http://${host}:${port}`);
+      return;
+    }
+    if (!backendProcess) break;
   }
-  log(`Backend ready at http://${host}:${port}`);
+
+  log(`Backend failed to become ready at http://${host}:${port}`);
 }
 
 function stopBackend() {
