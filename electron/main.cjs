@@ -5,13 +5,21 @@ const fs = require("fs");
 const os = require("os");
 const { spawn } = require("child_process");
 const net = require("net");
+const http = require("http");
 
 const APP_TITLE = "English Voice Generator";
 const isDev = !app.isPackaged;
 
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+  process.exit(0);
+}
+
 let mainWindow = null;
 let backendProcess = null;
 let installTriggered = false;
+let backendStartingPromise = null;
 
 let updateState = {
   checking: false,
@@ -111,6 +119,41 @@ function isPortInUse(port, host = "127.0.0.1") {
     socket.once("error", () => done(false));
     socket.connect(port, host);
   });
+}
+
+
+function probeBackendApi(host = "127.0.0.1", port = 3030, endpoint = "/api/key-stats") {
+  return new Promise((resolve) => {
+    const req = http.get(
+      {
+        host,
+        port,
+        path: endpoint,
+        timeout: 1200
+      },
+      (res) => {
+        const ok = res.statusCode && res.statusCode >= 200 && res.statusCode < 500;
+        res.resume();
+        resolve(Boolean(ok));
+      }
+    );
+
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+
+    req.on("error", () => resolve(false));
+  });
+}
+
+async function waitForBackendApi(host = "127.0.0.1", port = 3030, attempts = 24, delayMs = 250) {
+  for (let i = 0; i < attempts; i += 1) {
+    const ok = await probeBackendApi(host, port);
+    if (ok) return true;
+    await wait(delayMs);
+  }
+  return false;
 }
 
 function getUserDataDir() {
@@ -452,72 +495,84 @@ async function renderCustomBarsVideo(wavPath, outPath, durationSeconds, options 
 
 
 async function startBackend() {
+  if (backendStartingPromise) return backendStartingPromise;
   if (backendProcess && !backendProcess.killed) return;
 
-  const host = process.env.HOST || "127.0.0.1";
-  const port = Number(process.env.PORT || 3030);
-  const alreadyRunning = await isPortInUse(port, host);
-  if (alreadyRunning) {
-    log(`Backend already running at http://${host}:${port}, skip spawn.`);
-    return;
-  }
+  backendStartingPromise = (async () => {
+    const host = process.env.HOST || "127.0.0.1";
+    const port = Number(process.env.PORT || 3030);
 
-  const serverEntry = getServerEntry();
-  if (!fs.existsSync(serverEntry)) {
-    log(`server entry not found: ${serverEntry}`);
-    return;
-  }
+    const alreadyHealthy = await probeBackendApi(host, port);
+    if (alreadyHealthy) {
+      log(`Backend API already responding at http://${host}:${port}, skip spawn.`);
+      return;
+    }
 
-  log("APP STARTING...");
-  log("startBackend()");
-  log(`isDev = ${String(isDev)}`);
-  log(`command = ${process.execPath}`);
-  log(`serverEntry = ${serverEntry}`);
+    const alreadyRunning = await isPortInUse(port, host);
+    if (alreadyRunning) {
+      log(`Port ${host}:${port} is already in use but backend API is not responding. Skip spawn to avoid duplicate/conflict.`);
+      return;
+    }
 
-  backendProcess = spawn(process.execPath, [serverEntry], {
-    cwd: getProjectRoot(),
-    env: {
-      ...process.env,
-      PORT: process.env.PORT || "3030",
-      HOST: process.env.HOST || "127.0.0.1",
-      ELECTRON_RUN_AS_NODE: "1"
-    },
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
+    const serverEntry = getServerEntry();
+    if (!fs.existsSync(serverEntry)) {
+      log(`server entry not found: ${serverEntry}`);
+      return;
+    }
 
-  backendProcess.stdout?.on("data", (d) => {
-    const msg = String(d).trim();
-    if (msg) log(`[server] ${msg}`);
-  });
+    log("APP STARTING...");
+    log("startBackend()");
+    log(`isDev = ${String(isDev)}`);
+    log(`command = ${process.execPath}`);
+    log(`serverEntry = ${serverEntry}`);
 
-  backendProcess.stderr?.on("data", (d) => {
-    const msg = String(d).trim();
-    if (msg) log(`[server:error] ${msg}`);
-  });
+    backendProcess = spawn(process.execPath, [serverEntry], {
+      cwd: getProjectRoot(),
+      env: {
+        ...process.env,
+        PORT: process.env.PORT || "3030",
+        HOST: process.env.HOST || "127.0.0.1",
+        ELECTRON_RUN_AS_NODE: "1"
+      },
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
 
-  backendProcess.on("error", (error) => {
-    const message = error?.message || String(error || "Unknown backend spawn error");
-    log(`backend spawn error: ${message}`);
-    backendProcess = null;
-  });
+    backendProcess.stdout?.on("data", (d) => {
+      const msg = String(d).trim();
+      if (msg) log(`[server] ${msg}`);
+    });
 
-  backendProcess.on("exit", (code, signal) => {
-    log(`backend exited code=${code} signal=${signal}`);
-    backendProcess = null;
-  });
+    backendProcess.stderr?.on("data", (d) => {
+      const msg = String(d).trim();
+      if (msg) log(`[server:error] ${msg}`);
+    });
 
-  for (let i = 0; i < 20; i += 1) {
-    await wait(250);
-    const ok = await isPortInUse(port, host);
-    if (ok) {
+    backendProcess.on("error", (error) => {
+      const message = error?.message || String(error || "Unknown backend spawn error");
+      log(`backend spawn error: ${message}`);
+      backendProcess = null;
+    });
+
+    backendProcess.on("exit", (code, signal) => {
+      log(`backend exited code=${code} signal=${signal}`);
+      backendProcess = null;
+    });
+
+    const ready = await waitForBackendApi(host, port, 24, 250);
+    if (ready) {
       log(`Backend ready at http://${host}:${port}`);
       return;
     }
-    if (!backendProcess) break;
-  }
 
-  log(`Backend failed to become ready at http://${host}:${port}`);
+    log(`Backend failed to become ready at http://${host}:${port}`);
+  })();
+
+  try {
+    await backendStartingPromise;
+  } finally {
+    backendStartingPromise = null;
+  }
 }
 
 function stopBackend() {
@@ -637,8 +692,8 @@ async function composeFinalMediaFiles(payload = {}) {
 
   const audioDuration = await readAudioDuration(finalAudioPath) || ensureNumber(plan.estimatedDuration, 0);
   await renderCustomBarsVideo(finalAudioPath, barsVideo, audioDuration, {
-    width: 1360,
-    height: 900,
+    width: 560,
+    height: 44,
     fps: 24,
     barCount: 72,
     barWidth: 4,
@@ -667,7 +722,7 @@ async function composeFinalMediaFiles(payload = {}) {
     "-filter_complex",
     `[0:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720[bg];` +
     `[2:v]colorkey=0x000000:0.12:0.02[wave];` +
-    `[bg][wave]overlay=x=360:y=590:format=auto[vout]`,
+    `[bg][wave]overlay=x=(W-w)/2+20:y=590:format=auto[vout]`,
     "-map", "[vout]",
     "-map", "1:a",
     "-c:v", "libx264",
@@ -1112,6 +1167,14 @@ autoUpdater.on("error", (error) => {
   };
   logUpdater(`error ${message}`);
   sendUpdateStatus();
+});
+
+
+app.on("second-instance", () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
 });
 
 app.whenReady().then(async () => {
