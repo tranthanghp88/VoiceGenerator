@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { FaFolderOpen } from "react-icons/fa";
+import WaveSurfer from "wavesurfer.js";
 import MergePreviewPanel from "./components/MergePreviewPanel";
 import HistoryAudioPanel from "./components/HistoryAudioPanel";
 import KeyManagerPanel from "./components/KeyManagerPanel";
@@ -9,6 +11,8 @@ import VoiceManagerDialog from "./components/VoiceManagerDialog";
 import ScriptEditorPanel from "./components/ScriptEditorPanel";
 import AudioPlayerPanel from "./components/AudioPlayerPanel";
 import AboutPanel from "./components/AboutPanel";
+import BgmManagerDialog from "./components/BgmManagerDialog";
+import WaveformDialog from "./components/WaveformDialog";
 import {
   FaCheck,
   FaChevronDown,
@@ -25,8 +29,12 @@ import { useKeyManagerActions } from "./hooks/useKeyManagerActions";
 import { useVoiceManager } from "./hooks/useVoiceManager";
 import { useSpeakerPresetManager } from "./hooks/useSpeakerPresetManager";
 import { usePresetPanelBridge } from "./hooks/usePresetPanelBridge";
+import { useBgmAssets } from "./hooks/useBgmAssets";
 import { getVoiceModeFromType } from "./services/voiceUtils";
 import { getTextPlaceholder } from "./services/speakerPresets";
+import { buildBgmTag, type BgmAsset } from "./services/bgmStorage";
+import { extractScriptControlMarkers, isControlMarkerLine } from "./services/scriptMarkers";
+import { buildCompositionPlan } from "./services/mediaComposition";
 
 const MAX_CHARS = 12000;
 const PREVIEW_COOLDOWN_MS = 3000;
@@ -57,54 +65,48 @@ function parseScript(raw: string): ScriptLine[] {
       .map((line) => line.trim())
       .filter(Boolean);
 
-    let pendingMarkers: string[] = [];
+    const control = extractScriptControlMarkers(blockLines.filter((line) => line.startsWith("#")));
+    let controlAttached = false;
 
     blockLines.forEach((line) => {
       if (line.startsWith("#")) {
-        pendingMarkers.push(line);
+        if (!isControlMarkerLine(line)) {
+          return;
+        }
         return;
       }
 
+      const pushLine = (role: "A" | "R" | "BOTH", textValue: string) => {
+        const cleanText = String(textValue || "").trim();
+        const nextLine: ScriptLine = {
+          role,
+          text: cleanText,
+          blockId: blockIndex + 1
+        };
+
+        if (!controlAttached) {
+          if (typeof control.pauseSeconds === "number") nextLine.pauseSeconds = control.pauseSeconds;
+          if (control.bgm) nextLine.bgm = control.bgm;
+          if (control.markerLines.length) nextLine.markerLines = control.markerLines;
+          controlAttached = true;
+        }
+
+        lines.push(nextLine);
+      };
+
       const bothPrefix = line.match(/^(A\+R|BOTH):\s*/i);
       if (bothPrefix) {
-        const text = line.slice(bothPrefix[0].length).trim();
-        const mergedText = [...pendingMarkers, text].filter(Boolean).join(" ").trim();
-
-        lines.push({
-          role: "BOTH" as const,
-          text: mergedText,
-          blockId: blockIndex + 1
-        } as ScriptLine);
-
-        pendingMarkers = [];
+        pushLine("BOTH", line.slice(bothPrefix[0].length));
         return;
       }
 
       if (line.startsWith("A:")) {
-        const text = line.slice(2).trim();
-        const mergedText = [...pendingMarkers, text].filter(Boolean).join(" ").trim();
-
-        lines.push({
-          role: "A" as const,
-          text: mergedText,
-          blockId: blockIndex + 1
-        } as ScriptLine);
-
-        pendingMarkers = [];
+        pushLine("A", line.slice(2));
         return;
       }
 
       if (line.startsWith("R:")) {
-        const text = line.slice(2).trim();
-        const mergedText = [...pendingMarkers, text].filter(Boolean).join(" ").trim();
-
-        lines.push({
-          role: "R" as const,
-          text: mergedText,
-          blockId: blockIndex + 1
-        } as ScriptLine);
-
-        pendingMarkers = [];
+        pushLine("R", line.slice(2));
       }
     });
   });
@@ -126,14 +128,11 @@ function buildSingleVoiceScript(raw: string): ScriptLine[] {
       .map((line) => line.trim())
       .filter(Boolean);
 
-    let pendingMarkers: string[] = [];
-    let textParts: string[] = [];
+    const control = extractScriptControlMarkers(blockLines.filter((line) => line.startsWith("#")));
+    const textParts: string[] = [];
 
     blockLines.forEach((line) => {
-      if (line.startsWith("#")) {
-        pendingMarkers.push(line);
-        return;
-      }
+      if (line.startsWith("#")) return;
 
       if (/^(A\+R|BOTH):/i.test(line)) {
         const normalized = line.replace(/^(A\+R|BOTH):\s*/i, "").trim();
@@ -150,13 +149,16 @@ function buildSingleVoiceScript(raw: string): ScriptLine[] {
       textParts.push(line);
     });
 
-    const mergedText = [...pendingMarkers, ...textParts].filter(Boolean).join(" ").trim();
+    const mergedText = textParts.filter(Boolean).join(" ").trim();
 
     if (mergedText) {
       lines.push({
         role: "A",
         text: mergedText,
-        blockId: blockIndex + 1
+        blockId: blockIndex + 1,
+        pauseSeconds: control.pauseSeconds,
+        bgm: control.bgm,
+        markerLines: control.markerLines
       });
     }
   });
@@ -191,6 +193,21 @@ export default function App() {
   const [showVoicePanel, setShowVoicePanel] = useState(true);
   const [showStoragePanel, setShowStoragePanel] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
+  const [showBgmManager, setShowBgmManager] = useState(false);
+  const [scriptSelection, setScriptSelection] = useState({ start: 0, end: 0 });
+  const [bgmInsertVolume, setBgmInsertVolume] = useState("0.25");
+  const [bgmInsertDuration, setBgmInsertDuration] = useState("");
+  const [bgmInsertMode, setBgmInsertMode] = useState<"once" | "loop">("once");
+  const [isWavePanelOpen, setIsWavePanelOpen] = useState(false);
+  const [waveAudioPath, setWaveAudioPath] = useState("");
+  const [waveAudioUrl, setWaveAudioUrl] = useState("");
+  const [waveBackgroundImagePath, setWaveBackgroundImagePath] = useState("");
+  const [waveError, setWaveError] = useState("");
+  const [waveStatus, setWaveStatus] = useState("");
+  const [isWaveReady, setIsWaveReady] = useState(false);
+  const [isExportingFinalMedia, setIsExportingFinalMedia] = useState(false);
+  const [videoRenderProgress, setVideoRenderProgress] = useState(0);
+  const [waveDuration, setWaveDuration] = useState(0);
 
   const {
     managerTab,
@@ -232,6 +249,46 @@ export default function App() {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const waveContainerRef = useRef<HTMLDivElement | null>(null);
+
+  const probeAudioDurationFromUrl = async (url: string): Promise<number> => {
+    return new Promise((resolve, reject) => {
+      try {
+        const audio = document.createElement("audio");
+        let settled = false;
+
+        const cleanup = () => {
+          audio.removeEventListener("loadedmetadata", onLoaded);
+          audio.removeEventListener("error", onError);
+        };
+
+        const onLoaded = () => {
+          if (settled) return;
+          settled = true;
+          const duration = Number(audio.duration || 0);
+          cleanup();
+          resolve(Number.isFinite(duration) ? duration : 0);
+        };
+
+        const onError = () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(new Error("Không đọc được thời lượng audio nguồn."));
+        };
+
+        audio.preload = "metadata";
+        audio.addEventListener("loadedmetadata", onLoaded);
+        audio.addEventListener("error", onError);
+        audio.src = url;
+      } catch (error: any) {
+        reject(error);
+      }
+    });
+  };
+
+  const waveAudioPreviewRef = useRef<HTMLAudioElement | null>(null);
+  const waveSurferRef = useRef<any>(null);
   const script = useMemo(() => parseScript(text), [text]);
 
   const {
@@ -245,6 +302,22 @@ export default function App() {
   } = useAudioHistory({
     setAudioUrl
   });
+
+  const {
+    bgmAssets,
+    filteredBgmAssets,
+    loadingBgmAssets,
+    bgmMessage,
+    setBgmMessage,
+    bgmSearch,
+    setBgmSearch,
+    previewAssetId,
+    previewAudioUrl,
+    importBgmAssets,
+    deleteBgmAsset,
+    previewBgmAsset,
+    revokePreviewUrl
+  } = useBgmAssets();
 
   const scanAudioHistory = () => scanGeneratedAudioFiles(directoryHandle, directoryName);
   const hasSelectedFolder = !!directoryHandle || !!directoryName;
@@ -491,6 +564,66 @@ export default function App() {
     } catch {}
   }, [directoryName]);
 
+
+  useEffect(() => {
+    if (!isWavePanelOpen) return;
+    if (!waveContainerRef.current) {
+      return;
+    }
+
+    if (!waveSurferRef.current) {
+      waveSurferRef.current = WaveSurfer.create({
+        container: waveContainerRef.current,
+        height: 180,
+        waveColor: "#22c55e",
+        progressColor: "#86efac",
+        cursorColor: "#bbf7d0",
+        barWidth: 3,
+        barGap: 2,
+        barRadius: 999,
+        normalize: true
+      });
+
+      waveSurferRef.current.on("ready", () => {
+        const duration = Number(waveSurferRef.current?.getDuration?.() || 0);
+        setWaveDuration(duration);
+        setIsWaveReady(true);
+        setWaveError("");
+        setWaveStatus(duration > 0 ? `Audio sẵn sàng (${duration.toFixed(1)}s)` : "Audio sẵn sàng");
+      });
+
+      waveSurferRef.current.on("error", (error: any) => {
+        const message = error?.message || String(error || "Không thể load waveform");
+        setWaveError(message);
+        setWaveStatus("");
+        setIsWaveReady(false);
+      });
+    }
+  }, [isWavePanelOpen]);
+
+  useEffect(() => {
+    if (!waveAudioUrl || !waveSurferRef.current) return;
+    setWaveError("");
+    setWaveStatus("Đang load waveform...");
+    setIsWaveReady(false);
+    setWaveDuration(0);
+    waveSurferRef.current.load(waveAudioUrl);
+  }, [waveAudioUrl]);
+
+  useEffect(() => {
+    return () => {
+      try {
+        waveSurferRef.current?.destroy?.();
+      } catch {}
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (waveAudioUrl) URL.revokeObjectURL(waveAudioUrl);
+    };
+  }, [waveAudioUrl]);
+
   useEffect(() => {
     if (!audioUrl || !audioRef.current) return;
 
@@ -555,6 +688,185 @@ export default function App() {
   const handleCancelRename = () => {
     setRenameDraft(filePrefix);
     setShowRenameDialog(false);
+  };
+
+const handleSelectWaveAudio = async () => {
+  try {
+    setWaveError("");
+    setWaveStatus("");
+
+    const result = await window.electronAPI?.selectAudioFile?.();
+    if (!result || result.canceled || !result.path) return;
+
+    setWaveAudioPath(result.path);
+
+    // 👉 FIX CHÍNH: đọc file qua electron -> tạo blob
+    const readResult = await window.electronAPI?.readAudioFile?.({
+      filePath: result.path
+    });
+
+    if (!readResult?.ok || !readResult?.data) {
+      throw new Error(readResult?.error || "Không đọc được file audio");
+    }
+
+    const binary = atob(readResult.data);
+    const bytes = new Uint8Array(binary.length);
+
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+
+    const blob = new Blob([bytes], {
+      type: readResult.mimeType || "audio/wav"
+    });
+
+    const url = URL.createObjectURL(blob);
+    setWaveAudioUrl(url);
+    setIsWaveReady(true);
+    setWaveStatus("Đang đọc thời lượng audio nguồn...");
+
+    try {
+      const duration = await probeAudioDurationFromUrl(url);
+      setWaveDuration(duration);
+      setWaveStatus(duration > 0 ? `Audio sẵn sàng (${duration.toFixed(1)}s)` : "Audio đã sẵn sàng để dựng video.");
+    } catch (durationError: any) {
+      setWaveDuration(0);
+      setWaveStatus("Audio đã sẵn sàng để dựng video.");
+    }
+
+    setIsWavePanelOpen(true);
+  } catch (error: any) {
+    setWaveError(error?.message || "Không chọn được file audio");
+  }
+};
+
+  const handleOpenCurrentFolder = async () => {
+    const targetPath = String(directoryName || "").trim() || waveAudioPath || waveBackgroundImagePath;
+
+    if (!targetPath) {
+      alert("Chưa có thư mục để mở.");
+      return;
+    }
+
+    try {
+      const result = await window.electronAPI?.openFolderPath?.({ path: targetPath });
+      if (!result?.ok) {
+        throw new Error(result?.error || "Không thể mở thư mục.");
+      }
+    } catch (error: any) {
+      alert(error?.message || "Không thể mở thư mục.");
+    }
+  };
+
+  const handleSelectWaveBackgroundImage = async () => {
+  try {
+    setWaveError("");
+    const result = await window.electronAPI?.selectImageFile?.();
+    if (!result || result.canceled || !result.path) return;
+    setWaveBackgroundImagePath(result.path);
+  } catch (error: any) {
+    setWaveError(error?.message || "Không chọn được ảnh nền");
+  }
+};
+
+  const handleExportFinalMedia = async () => {
+    if (!waveAudioPath || !waveAudioUrl) {
+      alert("Hãy chọn file audio trước.");
+      return;
+    }
+
+    if (!waveBackgroundImagePath) {
+      alert("Hãy chọn ảnh nền trước.");
+      return;
+    }
+
+    const generationScript = buildGenerateScript();
+    if (!generationScript.length) {
+      alert("Script hiện tại chưa hợp lệ để dựng subtitle/BGM.");
+      return;
+    }
+
+    setIsExportingFinalMedia(true);
+    setVideoRenderProgress(8);
+    setProgress(8);
+    setStage("saving");
+    setChunkInfo((prev) => ({
+      ...prev,
+      eta: "Đang dựng video..."
+    }));
+    setWaveError("");
+    setWaveStatus("Đang chuẩn bị dựng audio final + SRT + video...");
+
+    let progressTimer: any = null;
+
+    try {
+      progressTimer = window.setInterval(() => {
+        setVideoRenderProgress((prev) => {
+          const next = prev < 70 ? prev + 7 : prev < 88 ? prev + 2 : prev;
+          setProgress(next);
+          return next;
+        });
+      }, 900);
+
+      const sourceDuration = Number(waveDuration || waveSurferRef.current?.getDuration?.() || 0);
+      const plan = buildCompositionPlan({
+        script: generationScript,
+        sourceDuration,
+        bgmAssets
+      });
+
+      setWaveStatus("Đang mix audio final và tạo subtitle...");
+      setVideoRenderProgress(24);
+      setProgress(24);
+
+      const result = await window.electronAPI?.composeFinalMedia?.({
+        sourceAudioPath: waveAudioPath,
+        backgroundImagePath: waveBackgroundImagePath,
+        plan
+      });
+
+      if (!result?.ok) {
+        throw new Error(result?.error || "Xuất media cuối thất bại");
+      }
+
+      if (progressTimer) {
+        window.clearInterval(progressTimer);
+        progressTimer = null;
+      }
+
+      setWaveStatus("Đang hoàn tất file video...");
+      setVideoRenderProgress(100);
+      setProgress(100);
+
+      const lines = [
+        result.finalAudioPath ? `Audio: ${result.finalAudioPath}` : "",
+        result.finalSrtPath ? `SRT: ${result.finalSrtPath}` : "",
+        result.finalVideoPath ? `Video: ${result.finalVideoPath}` : ""
+      ].filter(Boolean);
+
+      setWaveStatus("Đã xuất audio final + SRT + video hoàn chỉnh.");
+      alert(`Xuất media thành công:\n${lines.join("\n")}`);
+    } catch (error: any) {
+      if (progressTimer) {
+        window.clearInterval(progressTimer);
+      }
+      setWaveError(error?.message || "Xuất media cuối thất bại");
+      setWaveStatus("");
+      setVideoRenderProgress(0);
+      setProgress(0);
+    } finally {
+      if (progressTimer) {
+        window.clearInterval(progressTimer);
+      }
+      setIsExportingFinalMedia(false);
+      window.setTimeout(() => {
+        setVideoRenderProgress(0);
+        setChunkInfo((prev) => ({
+          ...prev,
+          eta: prev.total > 0 && prev.done < prev.total ? prev.eta : ""
+        }));
+      }, 1200);
+    }
   };
 
   const selectedVoiceItem = useMemo(() => {
@@ -789,6 +1101,64 @@ export default function App() {
     finalGenerateSpeakerSettings
   };
 
+  const insertTextAtCursor = (snippet: string) => {
+    setText((prev) => {
+      const safePrev = String(prev || "");
+      if (!safePrev) return `${snippet}\n`;
+
+      const start = Math.max(0, Math.min(scriptSelection.start || 0, safePrev.length));
+      const end = Math.max(start, Math.min(scriptSelection.end || start, safePrev.length));
+      const before = safePrev.slice(0, start);
+      const after = safePrev.slice(end);
+      const needsLeadingBreak = before.length > 0 && !before.endsWith("\n");
+      const needsTrailingBreak = after.length > 0 && !after.startsWith("\n");
+
+      return `${before}${needsLeadingBreak ? "\n" : ""}${snippet}${needsTrailingBreak ? "\n" : ""}${after}`;
+    });
+  };
+
+  const handleInsertBgmTag = (asset: BgmAsset) => {
+    const tag = buildBgmTag(asset, {
+      duration: bgmInsertDuration,
+      volume: bgmInsertVolume || asset.defaultVolume,
+      mode: bgmInsertMode
+    });
+    insertTextAtCursor(tag);
+    setShowBgmManager(false);
+    setBgmMessage(`Đã chèn tag: ${tag}`);
+  };
+
+  const bgmManagerNode = (
+    <BgmManagerDialog
+      show={showBgmManager}
+      onClose={() => {
+        setShowBgmManager(false);
+        revokePreviewUrl();
+      }}
+      assets={filteredBgmAssets}
+      loading={loadingBgmAssets}
+      message={bgmMessage}
+      search={bgmSearch}
+      setSearch={setBgmSearch}
+      onImport={importBgmAssets}
+      onDelete={(assetId) => {
+        void deleteBgmAsset(assetId);
+      }}
+      onInsertTag={handleInsertBgmTag}
+      insertVolume={bgmInsertVolume}
+      setInsertVolume={setBgmInsertVolume}
+      insertDuration={bgmInsertDuration}
+      setInsertDuration={setBgmInsertDuration}
+      insertMode={bgmInsertMode}
+      setInsertMode={setBgmInsertMode}
+      onPreview={(asset) => {
+        void previewBgmAsset(asset);
+      }}
+      previewAssetId={previewAssetId}
+      previewAudioUrl={previewAudioUrl}
+    />
+  );
+
   const mergePanelNode = (
     <MergePreviewPanel
       show={showMergePanel}
@@ -866,8 +1236,8 @@ export default function App() {
         </h1>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
-        <aside className="space-y-4 xl:col-span-4">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
+        <aside className="space-y-4 lg:col-span-4">
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
             <div className="flex items-center justify-between gap-3">
               <div>
@@ -944,13 +1314,22 @@ export default function App() {
                       <span className="text-slate-500">Chưa chọn thư mục</span>
                     )}
                   </div>
-                  <div className="mt-3">
+                  <div className="mt-3 flex flex-wrap gap-2">
                     <button
                       onClick={chooseFolder}
                       type="button"
                       className="rounded-xl bg-slate-700 px-4 py-2 text-sm font-medium text-white shadow hover:bg-slate-800"
                     >
                       {directoryName ? "Đổi thư mục" : "Chọn thư mục"}
+                    </button>
+                    <button
+                      onClick={handleOpenCurrentFolder}
+                      type="button"
+                      disabled={!directoryName}
+                      className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <FaFolderOpen />
+                      Mở thư mục
                     </button>
                   </div>
                 </div>
@@ -1082,7 +1461,7 @@ export default function App() {
           />
         </aside>
 
-        <main className="space-y-4 xl:col-span-8">
+        <main className="space-y-4 lg:col-span-8">
           <ScriptEditorPanel
             text={text}
             setText={setText}
@@ -1090,6 +1469,8 @@ export default function App() {
             format={format}
             language={language}
             getTextPlaceholder={getTextPlaceholder}
+            onOpenBgmManager={() => setShowBgmManager(true)}
+            onCursorChange={(start, end) => setScriptSelection({ start, end })}
           />
 
           <AppActionPanels
@@ -1131,7 +1512,10 @@ export default function App() {
             mergePanel={mergePanelNode}
             keyManagerPanel={keyManagerPanelNode}
             historyAudioPanel={historyAudioPanelNode}
+            onOpenWaveform={() => setIsWavePanelOpen(true)}
           />
+
+          {bgmManagerNode}
 
           {!supportsDirectoryPicker && (
             <div className="rounded-xl border border-yellow-300 bg-yellow-50 p-3 text-sm text-yellow-800">
@@ -1155,8 +1539,31 @@ export default function App() {
             isBusy={isBusy}
             onStopGeneration={stopGeneration}
           />
+
+
         </main>
       </div>
+
+
+      <WaveformDialog
+        show={isWavePanelOpen}
+        onClose={() => setIsWavePanelOpen(false)}
+        waveAudioPath={waveAudioPath}
+        waveBackgroundImagePath={waveBackgroundImagePath}
+        waveStatus={waveStatus}
+        waveDuration={waveDuration}
+        waveError={waveError}
+        waveAudioUrl={waveAudioUrl}
+        waveAudioPreviewRef={waveAudioPreviewRef}
+        waveContainerRef={waveContainerRef}
+        isExportingFinalMedia={isExportingFinalMedia}
+        isWaveReady={isWaveReady}
+        videoRenderProgress={videoRenderProgress}
+        onSelectAudio={handleSelectWaveAudio}
+        onSelectBackgroundImage={handleSelectWaveBackgroundImage}
+        onOpenFolder={handleOpenCurrentFolder}
+        onExportFinalMedia={handleExportFinalMedia}
+      />
 
       <VoiceManagerDialog
         show={showAddVoiceDialog}

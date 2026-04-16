@@ -14,7 +14,8 @@ import {
   enableKey,
   resetDisabledKeys,
   moveKeyToEnd,
-  normalizeKeys
+  normalizeKeys,
+  getKeyTier
 } from "./keyManager.mjs";
 
 import { initStats, logSuccess, logFail, getStats } from "./keyStats.mjs";
@@ -28,10 +29,13 @@ loadKeys();
 initStats(getKeyStatsTemplate());
 
 const SAMPLE_RATE = 24000;
-const TTS_MODEL = "gemini-2.5-flash-preview-tts";
+const GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts";
+const GEMINI_TTS_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TTS_MODEL}:generateContent`;
+const CLOUD_TTS_ENDPOINT = "https://texttospeech.googleapis.com/v1/text:synthesize";
 const MAX_RECENT_LOGS = 500;
 const JOB_TTL_MS = 30 * 60 * 1000;
 const CHUNK_CHAR_LIMIT = 900;
+const INTERNAL_RETRY_DELAYS_MS = [2000, 5000];
 
 const keyRuntime = {};
 const requestLogs = [];
@@ -240,6 +244,10 @@ function cleanupExpiredJobs() {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function syncRuntimeFromKeys() {
   const keys = getAllKeys();
 
@@ -248,6 +256,7 @@ function syncRuntimeFromKeys() {
       keyRuntime[item.label] = {
         lastStatus: "unknown",
         lastError: "",
+        lastProvider: "",
         totalChars: 0,
         updatedAt: null,
         quotaExceededCount: 0
@@ -270,6 +279,7 @@ function resetRuntimeFromKeys() {
     keyRuntime[label] = {
       lastStatus: "unknown",
       lastError: "",
+      lastProvider: "",
       totalChars: 0,
       updatedAt: null,
       quotaExceededCount: 0
@@ -300,6 +310,7 @@ function updateKeyRuntime(label, patch = {}) {
     keyRuntime[label] = {
       lastStatus: "unknown",
       lastError: "",
+      lastProvider: "",
       totalChars: 0,
       updatedAt: null,
       quotaExceededCount: 0
@@ -313,6 +324,21 @@ function updateKeyRuntime(label, patch = {}) {
   };
 }
 
+function extractRetrySeconds(message = "") {
+  const text = String(message || "");
+  const retryMatch =
+    text.match(/retry in\s+([\d.]+)\s*s/i) ||
+    text.match(/please retry in\s+([\d.]+)\s*s/i) ||
+    text.match(/try again in\s+([\d.]+)\s*s/i);
+
+  if (!retryMatch) return null;
+
+  const value = Number(retryMatch[1]);
+  if (!Number.isFinite(value) || value <= 0) return null;
+
+  return Math.max(1, Math.ceil(value));
+}
+
 function inferStatusFromError(message = "") {
   const text = String(message || "").toLowerCase();
 
@@ -320,7 +346,8 @@ function inferStatusFromError(message = "") {
     text.includes("quota") ||
     text.includes("resource_exhausted") ||
     text.includes("too many requests") ||
-    text.includes("rate limit")
+    text.includes("rate limit") ||
+    text.includes("429")
   ) {
     return "limited";
   }
@@ -329,9 +356,24 @@ function inferStatusFromError(message = "") {
     text.includes("api key not valid") ||
     text.includes("permission denied") ||
     text.includes("unauthenticated") ||
-    text.includes("forbidden")
+    text.includes("forbidden") ||
+    text.includes("invalid api key") ||
+    text.includes("request had invalid authentication credentials")
   ) {
     return "invalid";
+  }
+
+  if (
+    text.includes("internal error") ||
+    text.includes("an internal error has occurred") ||
+    text.includes("internal") ||
+    text.includes("http 500") ||
+    text.includes("500 internal") ||
+    text.includes("backend error") ||
+    text.includes("service unavailable") ||
+    text.includes("503")
+  ) {
+    return "error";
   }
 
   return "error";
@@ -508,7 +550,9 @@ function clamp16(value) {
 }
 
 function mixPcmBuffers(buffers, gains = []) {
-  const validBuffers = (Array.isArray(buffers) ? buffers : []).filter((buf) => Buffer.isBuffer(buf) && buf.length > 0);
+  const validBuffers = (Array.isArray(buffers) ? buffers : []).filter(
+    (buf) => Buffer.isBuffer(buf) && buf.length > 0
+  );
   if (!validBuffers.length) return Buffer.alloc(0);
   if (validBuffers.length === 1) return Buffer.from(validBuffers[0]);
 
@@ -554,7 +598,10 @@ function prependSilencePcm(pcmBuffer, seconds) {
 function isLikelySharedReaction(text) {
   const clean = String(text || "").trim().toLowerCase();
   if (!clean) return false;
-  if (clean.length <= 24 && /\b(ha|haha|hahaha|hehe|hihi|lol|wow|oh|oops|ah|uh|yeah)\b/.test(clean)) {
+  if (
+    clean.length <= 24 &&
+    /\b(ha|haha|hahaha|hehe|hihi|lol|wow|oh|oops|ah|uh|yeah)\b/.test(clean)
+  ) {
     return true;
   }
   return /^\W*(ha|he|hi){2,}/.test(clean);
@@ -651,7 +698,6 @@ function getPunctuationPauseSeconds(text, role, speakerSettings) {
   return 0;
 }
 
-
 function normalizeAutoPauseRules(rules) {
   return (Array.isArray(rules) ? rules : [])
     .map((rule) => ({
@@ -703,6 +749,25 @@ function resolvePauseFromMarkers(markers, rules) {
   return maxPause;
 }
 
+function mergeConsecutiveLines(lines = []) {
+  const merged = [];
+
+  for (const line of lines) {
+    const role = line?.role || "A";
+    const text = String(line?.text || "").trim();
+    if (!text) continue;
+
+    const prev = merged[merged.length - 1];
+    if (prev && prev.role === role) {
+      prev.text = `${prev.text} ${text}`.trim();
+    } else {
+      merged.push({ role, text });
+    }
+  }
+
+  return merged;
+}
+
 function normalizeScriptUnits(script, speakerSettings, maxChars = CHUNK_CHAR_LIMIT) {
   const autoEnabled = !!speakerSettings?.autoBlockPause;
   const manualBlockPause = Number(speakerSettings?.blockPause || 0);
@@ -750,8 +815,9 @@ function normalizeScriptUnits(script, speakerSettings, maxChars = CHUNK_CHAR_LIM
 
   groupedBlocks.forEach((block) => {
     let lastUnitIndexOfThisBlock = -1;
+    const mergedLines = mergeConsecutiveLines(block.lines);
 
-    block.lines.forEach((line) => {
+    mergedLines.forEach((line) => {
       const pieces = splitTextIntoPieces(line.text, maxChars);
 
       pieces.forEach((piece) => {
@@ -793,6 +859,7 @@ function buildKeySummary() {
     const rt = keyRuntime[item.label] || {
       lastStatus: "unknown",
       lastError: "",
+      lastProvider: "",
       totalChars: 0,
       updatedAt: null,
       quotaExceededCount: 0
@@ -804,8 +871,10 @@ function buildKeySummary() {
       keyId: item.label,
       maskedKey: item.label,
       rawKey: item.key,
+      tier: getKeyTier(item.label),
       isActive: uiStatus === "active",
       lastStatus: uiStatus,
+      lastProvider: String(rt.lastProvider || ""),
       totalSuccess: Number(s.success || 0),
       totalFail: Number(s.fail || 0),
       totalChars: Number(rt.totalChars || 0),
@@ -845,6 +914,38 @@ function normalizeVoiceType(value) {
   return v;
 }
 
+function getCloudLanguageCode(language = "en") {
+  return language === "vi" ? "vi-VN" : "en-US";
+}
+
+function getCloudVoiceForRole({ language = "en", role = "A", geminiVoiceName = "", gender = "" } = {}) {
+  const safeLang = language === "vi" ? "vi" : "en";
+  const safeRole = role === "R" ? "R" : "A";
+  const voice = String(geminiVoiceName || "").toLowerCase();
+  const safeGender = String(gender || "").toLowerCase();
+
+  if (safeLang === "vi") {
+    if (safeGender === "female" || safeRole === "R" || voice === "kore" || voice === "zephyr") {
+      return "vi-VN-Neural2-A";
+    }
+    return "vi-VN-Neural2-D";
+  }
+
+  if (safeGender === "female" || safeRole === "R" || voice === "kore" || voice === "zephyr") {
+    return "en-US-Neural2-F";
+  }
+
+  if (voice === "charon") {
+    return "en-US-Neural2-D";
+  }
+
+  if (voice === "fenrir") {
+    return "en-US-Neural2-I";
+  }
+
+  return "en-US-Neural2-J";
+}
+
 function resolveVoiceSelection(payload = {}) {
   const legacyVoiceMap = payload?.voiceMap;
   const voiceModeRaw = String(payload?.voiceMode || "").trim().toLowerCase();
@@ -862,6 +963,9 @@ function resolveVoiceSelection(payload = {}) {
     typeof legacyVoiceMap === "object" &&
     (legacyVoiceMap.A || legacyVoiceMap.R)
   ) {
+    const geminiA = legacyVoiceMap.A || "Puck";
+    const geminiR = legacyVoiceMap.R || "Kore";
+
     return {
       mode: "multi",
       label: "Legacy Podcast",
@@ -874,7 +978,7 @@ function resolveVoiceSelection(payload = {}) {
               speaker: "Host A",
               voiceConfig: {
                 prebuiltVoiceConfig: {
-                  voiceName: legacyVoiceMap.A || "Puck"
+                  voiceName: geminiA
                 }
               }
             },
@@ -882,12 +986,16 @@ function resolveVoiceSelection(payload = {}) {
               speaker: "Host B",
               voiceConfig: {
                 prebuiltVoiceConfig: {
-                  voiceName: legacyVoiceMap.R || "Kore"
+                  voiceName: geminiR
                 }
               }
             }
           ]
         }
+      },
+      fallbackCloudVoices: {
+        A: getCloudVoiceForRole({ language: "en", role: "A", geminiVoiceName: geminiA }),
+        R: getCloudVoiceForRole({ language: "en", role: "R", geminiVoiceName: geminiR })
       }
     };
   }
@@ -921,6 +1029,18 @@ function resolveVoiceSelection(payload = {}) {
             }
           ]
         }
+      },
+      fallbackCloudVoices: {
+        A: getCloudVoiceForRole({
+          language: "en",
+          role: "A",
+          geminiVoiceName: preset.speakers.A
+        }),
+        R: getCloudVoiceForRole({
+          language: "en",
+          role: "R",
+          geminiVoiceName: preset.speakers.R
+        })
       }
     };
   }
@@ -976,8 +1096,65 @@ function resolveVoiceSelection(payload = {}) {
           voiceName: singleVoice.apiId || "Puck"
         }
       }
-    }
+    },
+    fallbackCloudVoices: {
+      A: getCloudVoiceForRole({
+        language: singleVoice.language || "en",
+        role: "A",
+        geminiVoiceName: singleVoice.apiId || "Puck",
+        gender: singleVoice.gender || "male"
+      }),
+      R: getCloudVoiceForRole({
+        language: singleVoice.language || "en",
+        role: "R",
+        geminiVoiceName: singleVoice.apiId || "Kore",
+        gender: singleVoice.gender || "female"
+      })
+    },
+    singleSpeakerPreset
   };
+}
+
+function getGeminiVoiceNameFromSpeechConfig(requestSpeechConfig, role = "A") {
+  const speakerConfigs =
+    requestSpeechConfig?.multiSpeakerVoiceConfig?.speakerVoiceConfigs || [];
+
+  if (speakerConfigs.length) {
+    const speakerName = role === "R" ? "Host B" : "Host A";
+    return (
+      speakerConfigs.find((item) => item?.speaker === speakerName)?.voiceConfig?.prebuiltVoiceConfig
+        ?.voiceName || ""
+    );
+  }
+
+  return requestSpeechConfig?.voiceConfig?.prebuiltVoiceConfig?.voiceName || "";
+}
+
+function extractWavDataChunk(wavBuffer) {
+  if (!Buffer.isBuffer(wavBuffer) || wavBuffer.length < 44) {
+    return wavBuffer;
+  }
+
+  if (wavBuffer.toString("ascii", 0, 4) !== "RIFF" || wavBuffer.toString("ascii", 8, 12) !== "WAVE") {
+    return wavBuffer;
+  }
+
+  let offset = 12;
+
+  while (offset + 8 <= wavBuffer.length) {
+    const chunkId = wavBuffer.toString("ascii", offset, offset + 4);
+    const chunkSize = wavBuffer.readUInt32LE(offset + 4);
+    const chunkDataStart = offset + 8;
+    const chunkDataEnd = chunkDataStart + chunkSize;
+
+    if (chunkId === "data") {
+      return wavBuffer.slice(chunkDataStart, Math.min(chunkDataEnd, wavBuffer.length));
+    }
+
+    offset = chunkDataEnd + (chunkSize % 2);
+  }
+
+  return wavBuffer;
 }
 
 async function callGeminiTtsOnce({
@@ -994,30 +1171,27 @@ async function callGeminiTtsOnce({
     keyLabel: label,
     status: "processing",
     chars: totalChars,
-    message: `Bắt đầu chunk ${chunkIndex + 1}/${totalChunks}`
+    message: `Gemini start chunk ${chunkIndex + 1}/${totalChunks}`
   });
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": key
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [{ text: prompt }]
-          }
-        ],
-        generationConfig: {
-          responseModalities: ["AUDIO"],
-          speechConfig: requestSpeechConfig
+  const response = await fetch(GEMINI_TTS_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": key
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [{ text: prompt }]
         }
-      })
-    }
-  );
+      ],
+      generationConfig: {
+        responseModalities: ["AUDIO"],
+        speechConfig: requestSpeechConfig
+      }
+    })
+  });
 
   let data = null;
   try {
@@ -1033,26 +1207,7 @@ async function callGeminiTtsOnce({
       data?.error ||
       `HTTP ${response.status}`;
 
-    const status = inferStatusFromError(message);
-
-    updateKeyRuntime(label, {
-      lastStatus: status,
-      lastError: String(message || ""),
-      quotaExceededCount:
-        status === "limited"
-          ? (keyRuntime[label]?.quotaExceededCount || 0) + 1
-          : keyRuntime[label]?.quotaExceededCount || 0
-    });
-
-    addLog({
-      type: "request_fail",
-      keyLabel: label,
-      status,
-      chars: totalChars,
-      message: `Chunk ${chunkIndex + 1}/${totalChunks}: ${String(message || "")}`
-    });
-
-    throw new Error(String(message || "TTS request failed"));
+    throw new Error(String(message || "Gemini TTS request failed"));
   }
 
   const base64Audio =
@@ -1061,38 +1216,136 @@ async function callGeminiTtsOnce({
     data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
 
   if (!base64Audio) {
-    updateKeyRuntime(label, {
-      lastStatus: "error",
-      lastError: "Không nhận được audio từ Gemini TTS"
-    });
-
-    addLog({
-      type: "request_fail",
-      keyLabel: label,
-      status: "error",
-      chars: totalChars,
-      message: `Chunk ${chunkIndex + 1}/${totalChunks}: Không nhận được audio từ Gemini TTS`
-    });
-
     throw new Error("Không nhận được audio từ Gemini TTS");
   }
 
   const pcmBuffer = Buffer.from(base64Audio, "base64");
-
-  updateKeyRuntime(label, {
-    lastStatus: "active",
-    lastError: ""
-  });
 
   addLog({
     type: "request_success",
     keyLabel: label,
     status: "active",
     chars: totalChars,
-    message: `Chunk ${chunkIndex + 1}/${totalChunks}: Tạo audio thành công`
+    message: `Gemini OK chunk ${chunkIndex + 1}/${totalChunks}`
   });
 
-  return { pcmBuffer };
+  return { pcmBuffer, provider: "gemini" };
+}
+
+async function callCloudTtsOnce({
+  key,
+  label,
+  chunkScript,
+  cloudVoiceName,
+  language,
+  preset,
+  totalChars,
+  chunkIndex,
+  totalChunks
+}) {
+  addLog({
+    type: "request_start",
+    keyLabel: label,
+    status: "processing",
+    chars: totalChars,
+    message: `Cloud start chunk ${chunkIndex + 1}/${totalChunks}`
+  });
+
+  const ssml = buildSingleSpeakerPrompt(
+    chunkScript,
+    cloudVoiceName || "Cloud Voice",
+    language === "vi" ? "vi" : "en",
+    preset || {}
+  );
+
+  const response = await fetch(`${CLOUD_TTS_ENDPOINT}?key=${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      input: { ssml },
+      voice: {
+        languageCode: getCloudLanguageCode(language),
+        name: cloudVoiceName || getCloudVoiceForRole({ language, role: "A" })
+      },
+      audioConfig: {
+        audioEncoding: "LINEAR16",
+        sampleRateHertz: SAMPLE_RATE
+      }
+    })
+  });
+
+  let data = null;
+  try {
+    data = await response.json();
+  } catch {
+    data = null;
+  }
+
+  if (!response.ok) {
+    const message =
+      data?.error?.message ||
+      data?.error?.status ||
+      data?.error ||
+      `HTTP ${response.status}`;
+
+    throw new Error(String(message || "Cloud TTS request failed"));
+  }
+
+  if (!data?.audioContent) {
+    throw new Error("Không nhận được audio từ Cloud TTS");
+  }
+
+  const rawAudio = Buffer.from(data.audioContent, "base64");
+  const pcmBuffer = extractWavDataChunk(rawAudio);
+
+  addLog({
+    type: "request_success",
+    keyLabel: label,
+    status: "active",
+    chars: totalChars,
+    message: `Cloud OK chunk ${chunkIndex + 1}/${totalChunks}`
+  });
+
+  return { pcmBuffer, provider: "cloud" };
+}
+
+async function tryGeminiWithInternalRetry(args) {
+  try {
+    return await callGeminiTtsOnce(args);
+  } catch (error) {
+    const message = safeErrorMessage(error);
+    const status = inferStatusFromError(message);
+
+    if (status !== "error") {
+      throw error;
+    }
+
+    for (const delayMs of INTERNAL_RETRY_DELAYS_MS) {
+      addLog({
+        type: "retry_wait",
+        keyLabel: args.label,
+        status: "error",
+        chars: args.totalChars,
+        message: `Gemini internal retry sau ${Math.round(delayMs / 1000)}s`
+      });
+
+      await sleep(delayMs);
+
+      try {
+        return await callGeminiTtsOnce(args);
+      } catch (retryError) {
+        const retryMessage = safeErrorMessage(retryError);
+        const retryStatus = inferStatusFromError(retryMessage);
+        if (retryStatus !== "error") {
+          throw retryError;
+        }
+      }
+    }
+
+    throw error;
+  }
 }
 
 async function generateChunkWithRetry({
@@ -1100,47 +1353,87 @@ async function generateChunkWithRetry({
   requestSpeechConfig,
   promptBuilder,
   chunkIndex,
-  totalChunks
+  totalChunks,
+  language = "en"
 }) {
   const prompt = promptBuilder(chunkScript);
   const totalChars = getTotalChars(chunkScript);
-  const maxAttempts = Math.max(1, getAllKeys().length);
+  const totalKeyCount = Math.max(1, getAllKeys().length);
+  const triedLabels = new Set();
 
-  let attempts = 0;
+  while (triedLabels.size < totalKeyCount) {
+    let keyObj = getNextKey("paid", Array.from(triedLabels));
 
-  while (attempts < maxAttempts) {
-    const keyObj = getNextKey();
+    if (!keyObj) {
+      keyObj = getNextKey("free", Array.from(triedLabels));
+    }
+
+    if (!keyObj) {
+      keyObj = getNextKey("any", Array.from(triedLabels));
+    }
 
     if (!keyObj) {
       throw new Error("All keys are temporarily disabled. Wait for cooldown or reset cooldown in Key Manager.");
     }
 
     const { key, label } = keyObj;
+    const tier = getKeyTier(label);
+    triedLabels.add(label);
 
     addLog({
       type: "chunk_start",
       keyLabel: label,
       status: "processing",
       chars: totalChars,
-      message: `Chunk ${chunkIndex + 1}/${totalChunks} -> dùng ${label}`
+      message: `Chunk ${chunkIndex + 1}/${totalChunks} -> dùng ${label} [${tier}]`
     });
 
     try {
-      const result = await callGeminiTtsOnce({
-        key,
-        label,
-        prompt,
-        requestSpeechConfig,
-        totalChars,
-        chunkIndex,
-        totalChunks
-      });
+      let result = null;
+      let provider = "";
+
+      if (tier === "paid") {
+        const role = chunkScript?.[0]?.role === "R" ? "R" : "A";
+        const geminiVoiceName = getGeminiVoiceNameFromSpeechConfig(requestSpeechConfig, role);
+        const cloudVoiceName = getCloudVoiceForRole({
+          language,
+          role,
+          geminiVoiceName
+        });
+
+        result = await callCloudTtsOnce({
+          key,
+          label,
+          chunkScript,
+          cloudVoiceName,
+          language,
+          preset: {},
+          totalChars,
+          chunkIndex,
+          totalChunks
+        });
+        provider = "cloud_paid";
+      } else {
+        const geminiResult = await tryGeminiWithInternalRetry({
+          key,
+          label,
+          prompt,
+          requestSpeechConfig,
+          totalChars,
+          chunkIndex,
+          totalChunks
+        });
+
+        result = geminiResult;
+        provider = "gemini_free";
+      }
 
       logSuccess(label);
       enableKey(label);
       updateKeyRuntime(label, {
         lastStatus: "active",
         lastError: "",
+        lastProvider: provider,
         quotaExceededCount: 0,
         totalChars: (keyRuntime[label]?.totalChars || 0) + totalChars
       });
@@ -1152,12 +1445,12 @@ async function generateChunkWithRetry({
         keyLabel: label,
         status: "success",
         chars: totalChars,
-        message: `Chunk ${chunkIndex + 1}/${totalChunks} OK (${label})`
+        message: `Chunk ${chunkIndex + 1}/${totalChunks} OK (${label}) [${provider}]`
       });
 
       return {
         pcmBuffer: result.pcmBuffer,
-        keyLabel: label
+        keyLabel: `${label} [${provider}]`
       };
     } catch (error) {
       const message = safeErrorMessage(error);
@@ -1171,9 +1464,10 @@ async function generateChunkWithRetry({
           cooldownMs: 30 * 60 * 1000
         });
       } else if (status === "limited") {
+        const retrySeconds = extractRetrySeconds(message);
         disableKey(label, {
           reason: "limited",
-          cooldownMs: 2 * 60 * 1000
+          cooldownMs: (retrySeconds ? retrySeconds + 5 : 120) * 1000
         });
       }
 
@@ -1181,7 +1475,8 @@ async function generateChunkWithRetry({
 
       updateKeyRuntime(label, {
         lastStatus: status,
-        lastError: String(message)
+        lastError: String(message),
+        lastProvider: tier === "paid" ? "cloud_paid" : "gemini_free"
       });
 
       addLog({
@@ -1191,15 +1486,13 @@ async function generateChunkWithRetry({
         chars: totalChars,
         message: `Chunk ${chunkIndex + 1}/${totalChunks} FAIL (${label}) -> ${message}`
       });
-
-      attempts++;
     }
   }
 
   throw new Error(`Chunk ${chunkIndex + 1}/${totalChunks} failed on all available keys`);
 }
 
-function buildSingleSpeakerSelection(voiceName, language = "en") {
+function buildSingleSpeakerSelection(voiceName, language = "en", role = "A") {
   return {
     mode: "single",
     label: voiceName || "Single Voice",
@@ -1212,19 +1505,56 @@ function buildSingleSpeakerSelection(voiceName, language = "en") {
           voiceName: voiceName || "Puck"
         }
       }
-    }
+    },
+    fallbackCloudVoices: {
+      [role]: getCloudVoiceForRole({
+        language,
+        role,
+        geminiVoiceName: voiceName || (role === "R" ? "Kore" : "Puck")
+      })
+    },
+    speakerSettings: {
+      A: {},
+      R: {}
+    },
+    singleSpeakerPreset: {}
   };
 }
 
 function createBothSelection(selection) {
-  const speakerConfigs = selection?.requestSpeechConfig?.multiSpeakerVoiceConfig?.speakerVoiceConfigs || [];
-  const hostA = speakerConfigs.find((item) => item?.speaker === "Host A")?.voiceConfig?.prebuiltVoiceConfig?.voiceName || "Puck";
-  const hostB = speakerConfigs.find((item) => item?.speaker === "Host B")?.voiceConfig?.prebuiltVoiceConfig?.voiceName || "Kore";
+  const speakerConfigs =
+    selection?.requestSpeechConfig?.multiSpeakerVoiceConfig?.speakerVoiceConfigs || [];
+  const hostA =
+    speakerConfigs.find((item) => item?.speaker === "Host A")?.voiceConfig?.prebuiltVoiceConfig
+      ?.voiceName || "Puck";
+  const hostB =
+    speakerConfigs.find((item) => item?.speaker === "Host B")?.voiceConfig?.prebuiltVoiceConfig
+      ?.voiceName || "Kore";
   const language = selection?.language || "en";
 
   return {
-    A: buildSingleSpeakerSelection(hostA, language),
-    R: buildSingleSpeakerSelection(hostB, language)
+    A: {
+      ...buildSingleSpeakerSelection(hostA, language, "A"),
+      fallbackCloudVoices: {
+        A:
+          selection?.fallbackCloudVoices?.A ||
+          getCloudVoiceForRole({ language, role: "A", geminiVoiceName: hostA })
+      },
+      speakerSettings: {
+        A: selection?.speakerSettings?.A || {}
+      }
+    },
+    R: {
+      ...buildSingleSpeakerSelection(hostB, language, "R"),
+      fallbackCloudVoices: {
+        R:
+          selection?.fallbackCloudVoices?.R ||
+          getCloudVoiceForRole({ language, role: "R", geminiVoiceName: hostB })
+      },
+      speakerSettings: {
+        R: selection?.speakerSettings?.R || {}
+      }
+    }
   };
 }
 
@@ -1234,7 +1564,8 @@ async function synthesizeUnitsToWav({
   promptBuilder,
   fileName = "output.wav",
   onProgress,
-  bothSelection
+  bothSelection,
+  selection
 }) {
   if (!Array.isArray(units) || !units.length) {
     throw new Error("Không có units để synthesize");
@@ -1256,27 +1587,40 @@ async function synthesizeUnitsToWav({
           requestSpeechConfig: bothSelection.A.requestSpeechConfig,
           promptBuilder: bothSelection.A.promptBuilder,
           chunkIndex: i,
-          totalChunks: units.length
+          totalChunks: units.length,
+          selection: bothSelection.A,
+          roleForFallback: "A"
         }),
         generateChunkWithRetry({
           chunkScript: [{ role: "R", text: unit.text, blockId: unit.blockId }],
           requestSpeechConfig: bothSelection.R.requestSpeechConfig,
           promptBuilder: bothSelection.R.promptBuilder,
           chunkIndex: i,
-          totalChunks: units.length
+          totalChunks: units.length,
+          selection: bothSelection.R,
+          roleForFallback: "R"
         })
       ]);
 
       keyLabel = [resultA.keyLabel, resultR.keyLabel].filter(Boolean).join(" + ");
       const useNaturalStagger = isLikelySharedReaction(unit.text);
-      const pcmA = useNaturalStagger ? prependSilencePcm(resultA.pcmBuffer, 0.02) : resultA.pcmBuffer;
-      const pcmR = useNaturalStagger ? prependSilencePcm(resultR.pcmBuffer, 0.08) : resultR.pcmBuffer;
-      pcmBuffer = mixPcmBuffers([pcmA, pcmR], useNaturalStagger ? [0.7, 0.66] : [0.72, 0.72]);
+      const pcmA = useNaturalStagger
+        ? prependSilencePcm(resultA.pcmBuffer, 0.02)
+        : resultA.pcmBuffer;
+      const pcmR = useNaturalStagger
+        ? prependSilencePcm(resultR.pcmBuffer, 0.08)
+        : resultR.pcmBuffer;
+      pcmBuffer = mixPcmBuffers(
+        [pcmA, pcmR],
+        useNaturalStagger ? [0.7, 0.66] : [0.72, 0.72]
+      );
     } else {
+      const normalizedRole = unit.role === "BOTH" ? "A" : unit.role;
+
       const result = await generateChunkWithRetry({
         chunkScript: [
           {
-            role: unit.role === "BOTH" ? "A" : unit.role,
+            role: normalizedRole,
             text: unit.text,
             blockId: unit.blockId
           }
@@ -1284,7 +1628,9 @@ async function synthesizeUnitsToWav({
         requestSpeechConfig,
         promptBuilder,
         chunkIndex: i,
-        totalChunks: units.length
+        totalChunks: units.length,
+        selection,
+        roleForFallback: normalizedRole === "R" ? "R" : "A"
       });
 
       keyLabel = result.keyLabel;
@@ -1372,7 +1718,10 @@ async function processTtsJob(jobId, payload) {
   const script = payload?.script || [];
   const fileName = payload?.fileName || "output.wav";
   const speakerSettings = payload?.speakerSettings || {};
-  const selection = resolveVoiceSelection(payload);
+  const selection = {
+    ...resolveVoiceSelection(payload),
+    speakerSettings
+  };
 
   try {
     const units = normalizeScriptUnits(script, speakerSettings, CHUNK_CHAR_LIMIT);
@@ -1399,6 +1748,7 @@ async function processTtsJob(jobId, payload) {
       promptBuilder: selection.promptBuilder,
       fileName,
       bothSelection,
+      selection,
       onProgress: ({ index, total, keyLabel }) => {
         job.currentChunk = index + 1;
         job.currentKeyLabel = keyLabel;
@@ -1410,7 +1760,10 @@ async function processTtsJob(jobId, payload) {
 
         if (job.completedChunks > 0) {
           const avg = job.elapsedMs / job.completedChunks;
-          job.etaMs = Math.max(0, Math.round(avg * (job.totalChunks - job.completedChunks)));
+          job.etaMs = Math.max(
+            0,
+            Math.round(avg * (job.totalChunks - job.completedChunks))
+          );
         } else {
           job.etaMs = null;
         }
@@ -1528,7 +1881,8 @@ app.post("/api/generate", async (req, res) => {
       id: "default",
       apiId: "Puck",
       label: "Default Single Voice",
-      language: "en"
+      language: "en",
+      gender: "male"
     };
 
     const previewSettings = {
@@ -1540,7 +1894,13 @@ app.post("/api/generate", async (req, res) => {
           pause: String(pauseSecondsRaw > 0 ? pauseSecondsRaw : 0)
         }
       ],
-      blockPause: pauseSecondsRaw > 0 ? pauseSecondsRaw : 0
+      blockPause: pauseSecondsRaw > 0 ? pauseSecondsRaw : 0,
+      A: {
+        pause: pauseSecondsRaw > 0 ? pauseSecondsRaw : 0
+      },
+      R: {
+        pause: pauseSecondsRaw > 0 ? pauseSecondsRaw : 0
+      }
     };
 
     const normalizedPreviewScript = [
@@ -1557,8 +1917,10 @@ app.post("/api/generate", async (req, res) => {
       CHUNK_CHAR_LIMIT
     );
 
-    const result = await synthesizeUnitsToWav({
-      units,
+    const selection = {
+      mode: "single",
+      label: voice.label,
+      language: voice.language || "en",
       requestSpeechConfig: {
         voiceConfig: {
           prebuiltVoiceConfig: {
@@ -1572,7 +1934,32 @@ app.post("/api/generate", async (req, res) => {
           pitch: 1,
           pause: pauseSecondsRaw > 0 ? pauseSecondsRaw : 0
         }),
-      fileName
+      fallbackCloudVoices: {
+        A: getCloudVoiceForRole({
+          language: voice.language || "en",
+          role: "A",
+          geminiVoiceName: voice.apiId || "Puck",
+          gender: voice.gender || "male"
+        })
+      },
+      singleSpeakerPreset: {
+        speed: 1,
+        pitch: 1,
+        pause: pauseSecondsRaw > 0 ? pauseSecondsRaw : 0
+      },
+      speakerSettings: {
+        A: {
+          pause: pauseSecondsRaw > 0 ? pauseSecondsRaw : 0
+        }
+      }
+    };
+
+    const result = await synthesizeUnitsToWav({
+      units,
+      requestSpeechConfig: selection.requestSpeechConfig,
+      promptBuilder: selection.promptBuilder,
+      fileName,
+      selection
     });
 
     res.setHeader("Content-Type", "audio/wav");
@@ -1636,6 +2023,7 @@ app.get("/api/keys", (req, res) => {
   res.json(
     getAllKeys().map((item) => ({
       label: item.label,
+      tier: getKeyTier(item.label),
       disabled: !!item.disabled
     }))
   );
@@ -1732,35 +2120,60 @@ app.post("/api/test-all-keys", async (req, res) => {
     tested++;
 
     try {
-      const result = await callGeminiTtsOnce({
-        key: item.key,
-        label: item.label,
-        prompt: "Say clearly: test voice connection.",
-        requestSpeechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName: "Kore"
-            }
-          }
-        },
-        totalChars: 26,
-        chunkIndex: 0,
-        totalChunks: 1
-      });
+      const tier = getKeyTier(item.label);
+      let provider = "";
 
-      if (result?.pcmBuffer) {
-        enableKey(item.label);
-        updateKeyRuntime(item.label, {
-          lastStatus: "active",
-          lastError: "",
-          quotaExceededCount: 0
+      if (tier === "paid") {
+        const cloud = await callCloudTtsOnce({
+          key: item.key,
+          label: item.label,
+          chunkScript: [{ role: "A", text: "Say clearly: test voice connection.", blockId: 1 }],
+          cloudVoiceName: "en-US-Neural2-F",
+          language: "en",
+          preset: {},
+          totalChars: 26,
+          chunkIndex: 0,
+          totalChunks: 1
         });
+
+        if (cloud?.pcmBuffer) {
+          provider = "cloud_paid";
+        }
+      } else {
+        const result = await tryGeminiWithInternalRetry({
+          key: item.key,
+          label: item.label,
+          prompt: "Say clearly: test voice connection.",
+          requestSpeechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: "Kore"
+              }
+            }
+          },
+          totalChars: 26,
+          chunkIndex: 0,
+          totalChunks: 1
+        });
+
+        if (result?.pcmBuffer) {
+          provider = "gemini_free";
+        }
       }
+
+      enableKey(item.label);
+      updateKeyRuntime(item.label, {
+        lastStatus: "active",
+        lastError: "",
+        lastProvider: provider,
+        quotaExceededCount: 0
+      });
     } catch (error) {
       const message = safeErrorMessage(error);
       updateKeyRuntime(item.label, {
         lastStatus: inferStatusFromError(message),
-        lastError: String(message)
+        lastError: String(message),
+        lastProvider: ""
       });
     }
   }
@@ -1788,7 +2201,6 @@ app.post("/api/keys/reset-cooldown", (req, res) => {
     summary: buildKeySummary()
   });
 });
-
 
 app.post("/api/keys/clear", (req, res) => {
   clearAllKeys();

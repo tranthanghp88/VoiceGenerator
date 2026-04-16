@@ -1,17 +1,22 @@
 {
     "name":  "english-voice-generator",
     "private":  true,
-    "version":  "2.0.4",
+    "version":  "3.0.0",
     "description":  "Voice Generator",
     "main":  "electron/main.cjs",
     "type":  "module",
-    "author":  "TrÃ¡ÂºÂ§n VÃ„Æ’n ThÃ¡ÂºÂ¯ng",
+    "author":  "Tran Van Thang",
     "scripts":  {
                     "dev":  "vite",
                     "server":  "node server/index.mjs",
                     "build":  "vite build",
                     "preview":  "vite preview",
                     "electron:dev":  "electron .",
+                    "dev:vite":  "vite",
+                    "dev:server":  "node server/index.mjs",
+                    "dev:electron":  "electron .",
+                    "electron:wait":  "wait-on http://localhost:5173 \u0026\u0026 electron .",
+                    "start:all":  "concurrently -k -n SERVER,VITE,ELECTRON -c yellow,blue,green \"npm run dev:server\" \"npm run dev:vite\" \"npm run electron:wait\"",
                     "clean":  "rimraf dist release",
                     "dist":  "npm run clean \u0026\u0026 vite build \u0026\u0026 electron-builder --win nsis",
                     "dist:nsis":  "npm run clean \u0026\u0026 vite build \u0026\u0026 electron-builder --win nsis",
@@ -24,10 +29,12 @@
                          "cors":  "^2.8.6",
                          "electron-updater":  "^6.3.9",
                          "express":  "^4.22.1",
+                         "ffmpeg-static":  "^5.3.0",
                          "node-fetch":  "^3.3.2",
                          "react":  "^19.2.0",
                          "react-dom":  "^19.2.0",
-                         "react-icons":  "^5.6.0"
+                         "react-icons":  "^5.6.0",
+                         "wavesurfer.js":  "^7.12.6"
                      },
     "devDependencies":  {
                             "@types/axios":  "^0.9.36",
@@ -35,11 +42,13 @@
                             "@types/react":  "^19.2.14",
                             "@types/react-dom":  "^19.2.3",
                             "@vitejs/plugin-react":  "^5.0.0",
+                            "concurrently":  "^9.2.1",
                             "electron":  "^40.1.0",
                             "electron-builder":  "^26.0.12",
                             "rimraf":  "^6.0.1",
                             "typescript":  "~5.8.2",
-                            "vite":  "^6.2.0"
+                            "vite":  "^6.2.0",
+                            "wait-on":  "^9.0.5"
                         },
     "repository":  {
                        "type":  "git",
@@ -75,7 +84,10 @@
                                 "!**/node_modules/electron/**/*",
                                 "!**/node_modules/electron-builder/**/*",
                                 "!**/node_modules/vite/**/*",
-                                "!**/node_modules/@vitejs/**/*"
+                                "!**/node_modules/@vitejs/**/*",
+                                "!server/keys.txt",
+                                "!.env",
+                                "!.env.local"
                             ],
                   "extraMetadata":  {
                                         "main":  "electron/main.cjs"

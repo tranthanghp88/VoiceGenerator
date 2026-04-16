@@ -25,6 +25,26 @@ const DEFAULT_COOLDOWN_MS = 90 * 1000;
 const LIMITED_COOLDOWN_MS = 2 * 60 * 1000;
 const INVALID_COOLDOWN_MS = 30 * 60 * 1000;
 
+function detectKeyTier(label = "") {
+  const text = String(label || "").trim().toLowerCase();
+
+  if (
+    text.includes("paid") ||
+    text.includes("cloud") ||
+    text.includes("trial") ||
+    text.includes("billing") ||
+    text.includes("pro")
+  ) {
+    return "paid";
+  }
+
+  if (text.includes("free") || text.includes("gemini")) {
+    return "free";
+  }
+
+  return "free";
+}
+
 function pad2(num) {
   return String(num).padStart(2, "0");
 }
@@ -137,6 +157,7 @@ export function getAllKeys() {
 
     return {
       ...item,
+      tier: detectKeyTier(item.label),
       disabled,
       disabledReason: meta?.reason || "",
       disabledUntil: meta?.disabledUntil ? new Date(meta.disabledUntil).toISOString() : null
@@ -144,20 +165,33 @@ export function getAllKeys() {
   });
 }
 
-export function getNextKey() {
+export function getNextKey(preferredTier = "any", excludeLabels = []) {
   if (queue.length === 0) return null;
 
+  const excluded = new Set(Array.isArray(excludeLabels) ? excludeLabels : []);
   let attempts = 0;
 
   while (attempts < queue.length) {
     const item = queue[index % queue.length];
     index++;
 
-    if (!isDisabledInternal(item.label)) {
-      return item;
+    if (excluded.has(item.label)) {
+      attempts++;
+      continue;
     }
 
-    attempts++;
+    if (isDisabledInternal(item.label)) {
+      attempts++;
+      continue;
+    }
+
+    const tier = detectKeyTier(item.label);
+    if (preferredTier !== "any" && tier !== preferredTier) {
+      attempts++;
+      continue;
+    }
+
+    return item;
   }
 
   return null;
@@ -280,6 +314,10 @@ export function normalizeKeys() {
   return {
     totalKeys: keys.length
   };
+}
+
+export function getKeyTier(label) {
+  return detectKeyTier(label);
 }
 
 export function getKeyStatsTemplate() {

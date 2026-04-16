@@ -23,6 +23,7 @@ type AppActionPanelsProps = {
   mergePanel: React.ReactNode;
   keyManagerPanel: React.ReactNode;
   historyAudioPanel: React.ReactNode;
+  onOpenWaveform: () => void;
 };
 
 export default function AppActionPanels({
@@ -40,7 +41,8 @@ export default function AppActionPanels({
   onGenerate,
   mergePanel,
   keyManagerPanel,
-  historyAudioPanel
+  historyAudioPanel,
+  onOpenWaveform
 }: AppActionPanelsProps) {
   return (
     <div className="space-y-3">
@@ -79,6 +81,15 @@ export default function AppActionPanels({
           {showHistoryAudio ? "Ẩn lịch sử audio" : "Lịch sử audio"}
         </button>
 
+
+        <button
+          type="button"
+          onClick={onOpenWaveform}
+          className="flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-white shadow"
+        >
+          <FaPlay />
+          Dựng Video
+        </button>
         <button
           onClick={onGenerate}
           disabled={isBusy}

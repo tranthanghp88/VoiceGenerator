@@ -11,6 +11,15 @@ export type ScriptLine = {
   role: "A" | "R" | "BOTH";
   text: string;
   blockId?: number;
+  pauseSeconds?: number;
+  bgm?: {
+    id: string;
+    duration?: number;
+    volume?: number;
+    mode?: "once" | "loop";
+    raw: string;
+  } | null;
+  markerLines?: string[];
 };
 
 export type SpeakerPreset = {

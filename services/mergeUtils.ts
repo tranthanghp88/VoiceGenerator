@@ -33,6 +33,12 @@ type ElectronFileEntry = {
   getFile: () => Promise<File>;
 };
 
+type ElectronListedAudioFile = {
+  name: string;
+  path: string;
+  size: number;
+};
+
 type MergeSource = any | string | null;
 
 export function pad3(num: number) {
@@ -133,7 +139,6 @@ async function createElectronFileFromPath(
 async function listMergeEntries(source: MergeSource): Promise<Array<BrowserFileEntry | ElectronFileEntry>> {
   if (!source) return [];
 
-  // Browser FileSystemDirectoryHandle
   if (isRealDirectoryHandle(source)) {
     const entries: BrowserFileEntry[] = [];
 
@@ -154,7 +159,6 @@ async function listMergeEntries(source: MergeSource): Promise<Array<BrowserFileE
     return entries.sort((a, b) => compareFileNames(a.name, b.name));
   }
 
-  // Electron folder path
   if (typeof source === "string" && source.trim() && window.electronAPI?.listAudioFiles) {
     const result = await window.electronAPI.listAudioFiles({
       folderPath: source
@@ -164,9 +168,11 @@ async function listMergeEntries(source: MergeSource): Promise<Array<BrowserFileE
       throw new Error(result?.error || "Không thể quét thư mục audio");
     }
 
-    const entries: ElectronFileEntry[] = (result.files || [])
-      .filter((item) => !item.name.toLowerCase().endsWith("-final.wav"))
-      .map((item) => ({
+    const files: ElectronListedAudioFile[] = Array.isArray(result.files) ? result.files : [];
+
+    const entries: ElectronFileEntry[] = files
+      .filter((item: ElectronListedAudioFile) => !!item?.name && !item.name.toLowerCase().endsWith("-final.wav"))
+      .map((item: ElectronListedAudioFile) => ({
         kind: "file",
         name: item.name,
         path: item.path,
@@ -334,7 +340,7 @@ export async function buildMergePreview(source: MergeSource): Promise<MergePrevi
   }
 
   const reference = valid[0];
-  const normalizedValid = valid.filter((item) => {
+  const normalizedValid = valid.filter((item: MergePreviewItem) => {
     if (!reference) return true;
 
     const sameFormat =
@@ -357,7 +363,7 @@ export async function buildMergePreview(source: MergeSource): Promise<MergePrevi
   }
 
   const sequences = normalizedValid
-    .map((item) => item.seq)
+    .map((item: MergePreviewItem) => item.seq)
     .filter((n): n is number => typeof n === "number")
     .sort((a, b) => a - b);
 
@@ -393,11 +399,11 @@ export async function scanMergePreview(prefix: string, source: MergeSource) {
   }
 
   const firstSeq = preview.validFiles.length
-    ? preview.validFiles.find((item) => item.seq != null)?.seq
+    ? preview.validFiles.find((item: MergePreviewItem) => item.seq != null)?.seq
     : null;
 
   const lastSeq = preview.validFiles.length
-    ? [...preview.validFiles].reverse().find((item) => item.seq != null)?.seq
+    ? [...preview.validFiles].reverse().find((item: MergePreviewItem) => item.seq != null)?.seq
     : null;
 
   const message = [
