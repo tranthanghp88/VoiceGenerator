@@ -4,15 +4,12 @@ const fs = require("fs");
 const os = require("os");
 const { spawn } = require("child_process");
 const net = require("net");
-const { pathToFileURL } = require("url");
 
 const APP_TITLE = "English Voice Generator";
 const isDev = !app.isPackaged;
 
 let mainWindow = null;
 let backendProcess = null;
-let backendStartingPromise = null;
-let backendModuleLoaded = false;
 
 function log(message) {
   const line = `[${new Date().toISOString()}] [main] ${message}`;
@@ -29,14 +26,7 @@ function getProjectRoot() {
 }
 
 function getPreloadPath() {
-  const appPath = typeof app.getAppPath === "function" ? app.getAppPath() : "";
-  const candidates = [
-    path.join(__dirname, "preload.cjs"),
-    path.join(appPath, "electron", "preload.cjs"),
-    path.join(process.resourcesPath || "", "app.asar.unpacked", "electron", "preload.cjs"),
-    path.join(process.resourcesPath || "", "electron", "preload.cjs")
-  ].filter(Boolean);
-  return candidates.find((p) => fs.existsSync(p)) || candidates[0];
+  return path.join(__dirname, "preload.cjs");
 }
 
 function getRendererUrl() {
@@ -44,25 +34,11 @@ function getRendererUrl() {
 }
 
 function getRendererFile() {
-  const appPath = typeof app.getAppPath === "function" ? app.getAppPath() : "";
-  const candidates = [
-    path.join(getProjectRoot(), "dist", "index.html"),
-    path.join(appPath, "dist", "index.html"),
-    path.join(process.resourcesPath || "", "app.asar.unpacked", "dist", "index.html"),
-    path.join(process.resourcesPath || "", "dist", "index.html")
-  ].filter(Boolean);
-  return candidates.find((p) => fs.existsSync(p)) || candidates[0];
+  return path.join(getProjectRoot(), "dist", "index.html");
 }
 
 function getServerEntry() {
-  const appPath = typeof app.getAppPath === "function" ? app.getAppPath() : "";
-  const candidates = [
-    path.join(getProjectRoot(), "server", "index.mjs"),
-    path.join(appPath, "server", "index.mjs"),
-    path.join(process.resourcesPath || "", "app.asar.unpacked", "server", "index.mjs"),
-    path.join(process.resourcesPath || "", "server", "index.mjs")
-  ].filter(Boolean);
-  return candidates.find((p) => fs.existsSync(p)) || candidates[0];
+  return path.join(getProjectRoot(), "server", "index.mjs");
 }
 
 function ensureNumber(value, fallback = 0) {
@@ -112,14 +88,6 @@ function isPortInUse(port, host = "127.0.0.1") {
     socket.once("error", () => done(false));
     socket.connect(port, host);
   });
-}
-
-async function waitForBackendApi(host, port, attempts = 40, delayMs = 250) {
-  for (let i = 0; i < attempts; i += 1) {
-    if (await isPortInUse(port, host)) return true;
-    await wait(delayMs);
-  }
-  return false;
 }
 
 function getUserDataDir() {
@@ -294,63 +262,78 @@ function readMono16WavSamples(filePath) {
   return { samples, sampleRate };
 }
 
-function drawRectRgb(frame, width, height, x, y, w, h, rgb = [255, 255, 255]) {
+function drawRoundedRectRgb(frame, width, height, x, y, w, h, radius = 9999, rgb = [255, 255, 255]) {
   const x0 = Math.max(0, Math.floor(x));
   const y0 = Math.max(0, Math.floor(y));
-  const x1 = Math.min(width, Math.floor(x + w));
-  const y1 = Math.min(height, Math.floor(y + h));
+  const rectW = Math.max(1, Math.floor(w));
+  const rectH = Math.max(1, Math.floor(h));
+  const x1 = Math.min(width, x0 + rectW);
+  const y1 = Math.min(height, y0 + rectH);
+  const r = Math.max(0, Math.min(Math.floor(radius), Math.floor(rectW / 2), Math.floor(rectH / 2)));
+
   for (let yy = y0; yy < y1; yy += 1) {
-    let row = (yy * width + x0) * 3;
     for (let xx = x0; xx < x1; xx += 1) {
-      frame[row] = rgb[0];
-      frame[row + 1] = rgb[1];
-      frame[row + 2] = rgb[2];
-      row += 3;
+      let inside = false;
+      if (r <= 0) {
+        inside = true;
+      } else if (xx >= x0 + r && xx < x1 - r) {
+        inside = true;
+      } else if (yy >= y0 + r && yy < y1 - r) {
+        inside = true;
+      } else {
+        const cx = xx < x0 + r ? x0 + r - 1 : x1 - r;
+        const cy = yy < y0 + r ? y0 + r - 1 : y1 - r;
+        const dx = xx - cx;
+        const dy = yy - cy;
+        inside = (dx * dx + dy * dy) <= (r * r);
+      }
+      if (inside) {
+        const idx = (yy * width + xx) * 3;
+        frame[idx] = rgb[0];
+        frame[idx + 1] = rgb[1];
+        frame[idx + 2] = rgb[2];
+      }
     }
   }
 }
 
 async function renderCustomBarsVideo(wavPath, outPath, durationSeconds, options = {}) {
   const { samples, sampleRate } = readMono16WavSamples(wavPath);
-  const width = Math.max(120, ensureNumber(options.width, 860));
-  const height = Math.max(60, ensureNumber(options.height, 140));
-  const fps = Math.max(6, ensureNumber(options.fps, 10));
-  const barCount = Math.max(12, ensureNumber(options.barCount, 34));
-  const barWidth = Math.max(6, ensureNumber(options.barWidth, 14));
-  const gap = Math.max(4, ensureNumber(options.gap, 10));
-  const bottomPadding = Math.max(2, ensureNumber(options.bottomPadding, 6));
-  const minBarHeight = Math.max(4, ensureNumber(options.minBarHeight, 8));
-  const historySeconds = Math.max(0.8, ensureNumber(options.historySeconds, 2.4));
-  const smoothWindowMs = Math.max(30, ensureNumber(options.smoothWindowMs, 80));
+  const width = Math.max(120, ensureNumber(options.width, 560));
+  const height = Math.max(40, ensureNumber(options.height, 44));
+  const fps = Math.max(12, ensureNumber(options.fps, 24));
+  const barCount = Math.max(24, ensureNumber(options.barCount, 84));
+  const barWidth = Math.max(2, ensureNumber(options.barWidth, 4));
+  const gap = Math.max(0, ensureNumber(options.gap, 0));
+  const bottomPadding = Math.max(1, ensureNumber(options.bottomPadding, 2));
+  const minBarHeight = Math.max(2, ensureNumber(options.minBarHeight, 4));
+  const maxBarHeight = Math.max(minBarHeight + 2, ensureNumber(options.maxBarHeight, 30));
+  const historySeconds = Math.max(0.6, ensureNumber(options.historySeconds, 2.2));
+  const smoothWindowMs = Math.max(20, ensureNumber(options.smoothWindowMs, 92));
+  const idleMin = Math.max(1, ensureNumber(options.idleMin, 4));
+  const idleMax = Math.max(idleMin + 1, ensureNumber(options.idleMax, 10));
+  const speakingBoost = Math.max(0.5, ensureNumber(options.speakingBoost, 3.15));
+  const activeSpan = Math.max(1, ensureNumber(options.activeSpan, 9));
+  const spreadBias = Math.max(0.1, Math.min(2, ensureNumber(options.spreadBias, 0.82)));
+  const smoothingUp = Math.max(0.01, Math.min(1, ensureNumber(options.smoothingUp, 0.26)));
+  const smoothingDown = Math.max(0.01, Math.min(1, ensureNumber(options.smoothingDown, 0.20)));
+  const borderRadius = Math.max(0, ensureNumber(options.borderRadius, 9999));
   const sampleWindow = Math.max(64, Math.round(sampleRate * (smoothWindowMs / 1000)));
   const historySamples = Math.max(sampleWindow * 2, Math.round(sampleRate * historySeconds));
   const totalFrames = Math.max(1, Math.ceil(durationSeconds * fps));
 
   await new Promise((resolve, reject) => {
     const args = [
-      "-y",
-      "-f", "rawvideo",
-      "-pix_fmt", "rgb24",
-      "-s", `${width}x${height}`,
-      "-r", String(fps),
-      "-i", "-",
-      "-an",
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "18",
-      "-pix_fmt", "yuv420p",
-      outPath
+      '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', `${width}x${height}`,
+      '-r', String(fps), '-i', '-', '-an', '-c:v', 'libx264', '-preset', 'veryfast',
+      '-crf', '18', '-pix_fmt', 'yuv420p', outPath
     ];
 
-    const proc = spawn("ffmpeg", args, {
-      windowsHide: true,
-      stdio: ["pipe", "ignore", "pipe"]
-    });
-
-    let stderr = "";
-    proc.stderr?.on("data", (d) => { stderr += String(d); });
-    proc.on("error", (err) => reject(new Error(err?.message || String(err))));
-    proc.on("close", (code) => {
+    const proc = spawn('ffmpeg', args, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+    let stderr = '';
+    proc.stderr?.on('data', (d) => { stderr += String(d); });
+    proc.on('error', (err) => reject(new Error(err?.message || String(err))));
+    proc.on('close', (code) => {
       if (code === 0) resolve();
       else reject(new Error(stderr || `ffmpeg exited with code ${code}`));
     });
@@ -358,11 +341,16 @@ async function renderCustomBarsVideo(wavPath, outPath, durationSeconds, options 
     const maxAmp = 32768;
     const usableWidth = barCount * barWidth + (barCount - 1) * gap;
     const startX = Math.max(0, Math.floor((width - usableWidth) / 2));
+    const targets = new Array(barCount).fill(idleMin);
+    const currents = new Array(barCount).fill(idleMin);
 
     for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += 1) {
       const frame = Buffer.alloc(width * height * 3, 0);
       const t = frameIndex / fps;
       const center = Math.floor(t * sampleRate);
+
+      let strongestIndex = Math.floor(barCount / 2);
+      let strongestEnergy = 0;
 
       for (let barIndex = 0; barIndex < barCount; barIndex += 1) {
         const rel = barCount === 1 ? 0 : barIndex / (barCount - 1);
@@ -381,12 +369,39 @@ async function renderCustomBarsVideo(wavPath, outPath, durationSeconds, options 
 
         const rms = count > 0 ? Math.sqrt(sum / count) : 0;
         const centerBias = 1 - Math.abs((barIndex - (barCount - 1) / 2) / Math.max(1, barCount / 2));
-        const shaped = rms * (0.78 + centerBias * 0.22);
-        const eased = Math.pow(Math.min(1, shaped * 1.8), 1.2);
-        const barHeight = Math.max(minBarHeight, Math.round(4 + eased * 24));
+        const shaped = rms * (0.74 + centerBias * 0.26);
+        if (shaped > strongestEnergy) {
+          strongestEnergy = shaped;
+          strongestIndex = barIndex;
+        }
+
+        const idleNoise = (Math.sin((frameIndex * 0.09) + (barIndex * 0.36)) + 1) * 0.5;
+        targets[barIndex] = idleMin + idleNoise * Math.max(0, idleMax - idleMin);
+      }
+
+      const speakingCenter = strongestIndex;
+      const speakingStrength = Math.pow(Math.min(1, strongestEnergy * speakingBoost), 1.03);
+      for (let barIndex = 0; barIndex < barCount; barIndex += 1) {
+        const dist = Math.abs(barIndex - speakingCenter);
+        const spread = Math.max(0, 1 - (dist / activeSpan));
+        const spreadShaped = Math.pow(spread, spreadBias);
+        if (spreadShaped > 0) {
+          const lift = speakingStrength * spreadShaped * (maxBarHeight - idleMin);
+          targets[barIndex] = Math.max(targets[barIndex], idleMin + lift);
+        }
+      }
+
+      for (let barIndex = 0; barIndex < barCount; barIndex += 1) {
+        const current = currents[barIndex];
+        const target = Math.max(minBarHeight, Math.min(maxBarHeight, targets[barIndex]));
+        const factor = target > current ? smoothingUp : smoothingDown;
+        const next = current + (target - current) * factor;
+        currents[barIndex] = next;
+
+        const barHeight = Math.max(minBarHeight, Math.round(next));
         const x = startX + barIndex * (barWidth + gap);
-        const y = height - bottomPadding - barHeight;
-        drawRectRgb(frame, width, height, x, y, barWidth, barHeight, [255, 255, 255]);
+        const y = Math.max(0, height - bottomPadding - barHeight);
+        drawRoundedRectRgb(frame, width, height, x, y, barWidth, barHeight, borderRadius, [255, 255, 255]);
       }
 
       proc.stdin.write(frame);
@@ -396,83 +411,60 @@ async function renderCustomBarsVideo(wavPath, outPath, durationSeconds, options 
   });
 }
 
-
 async function startBackend() {
-  if (backendStartingPromise) return backendStartingPromise;
   if (backendProcess && !backendProcess.killed) return;
 
-  backendStartingPromise = (async () => {
-    const host = process.env.HOST || "127.0.0.1";
-    const port = Number(process.env.PORT || 3030);
-
-    const alreadyRunning = await isPortInUse(port, host);
-    if (alreadyRunning) {
-      log(`Backend already running at http://${host}:${port}, skip start.`);
-      return;
-    }
-
-    const serverEntry = getServerEntry();
-    log(`resolved serverEntry = ${serverEntry}`);
-    log(`serverEntry exists = ${String(!!serverEntry && fs.existsSync(serverEntry))}`);
-
-    if (!serverEntry || !fs.existsSync(serverEntry)) {
-      log(`server entry not found: ${serverEntry}`);
-      return;
-    }
-
-    if (isDev) {
-      log("APP STARTING DEV BACKEND...");
-      backendProcess = spawn(process.execPath, [serverEntry], {
-        cwd: path.dirname(serverEntry),
-        env: {
-          ...process.env,
-          PORT: process.env.PORT || "3030",
-          HOST: process.env.HOST || "127.0.0.1",
-          ELECTRON_RUN_AS_NODE: "1"
-        },
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"]
-      });
-
-      backendProcess.stdout?.on("data", (d) => {
-        const msg = String(d).trim();
-        if (msg) log(`[server] ${msg}`);
-      });
-
-      backendProcess.stderr?.on("data", (d) => {
-        const msg = String(d).trim();
-        if (msg) log(`[server:error] ${msg}`);
-      });
-
-      backendProcess.on("error", (err) => {
-        log(`backend spawn error: ${err?.message || String(err)}`);
-      });
-
-      backendProcess.on("exit", (code, signal) => {
-        log(`backend exited code=${code} signal=${signal}`);
-        backendProcess = null;
-      });
-    } else {
-      if (backendModuleLoaded) {
-        log("backend module already loaded in process.");
-      } else {
-        log("APP STARTING PRODUCTION BACKEND VIA IMPORT...");
-        process.env.PORT = process.env.PORT || "3030";
-        process.env.HOST = process.env.HOST || "127.0.0.1";
-        await import(pathToFileURL(serverEntry).href);
-        backendModuleLoaded = true;
-      }
-    }
-
-    const ready = await waitForBackendApi(host, port, 40, 250);
-    log(ready ? `Backend ready at http://${host}:${port}` : `Backend failed to become ready at http://${host}:${port}`);
-  })();
-
-  try {
-    await backendStartingPromise;
-  } finally {
-    backendStartingPromise = null;
+  const host = process.env.HOST || "127.0.0.1";
+  const port = Number(process.env.PORT || 3030);
+  const alreadyRunning = await isPortInUse(port, host);
+  if (alreadyRunning) {
+    log(`Backend already running at http://${host}:${port}, skip spawn.`);
+    return;
   }
+
+  const serverEntry = getServerEntry();
+  if (!fs.existsSync(serverEntry)) {
+    log(`server entry not found: ${serverEntry}`);
+    return;
+  }
+
+  log("APP STARTING...");
+  log("startBackend()");
+  log(`isDev = ${String(isDev)}`);
+  log(`command = ${process.execPath}`);
+  log(`serverEntry = ${serverEntry}`);
+
+  backendProcess = spawn(process.execPath, [serverEntry], {
+    cwd: getProjectRoot(),
+    env: {
+      ...process.env,
+      PORT: process.env.PORT || "3030",
+      HOST: process.env.HOST || "127.0.0.1",
+      ELECTRON_RUN_AS_NODE: "1"
+    },
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  backendProcess.stdout?.on("data", (d) => {
+    const msg = String(d).trim();
+    if (msg) log(`[server] ${msg}`);
+  });
+
+  backendProcess.stderr?.on("data", (d) => {
+    const msg = String(d).trim();
+    if (msg) log(`[server:error] ${msg}`);
+  });
+
+  backendProcess.on("exit", (code, signal) => {
+    log(`backend exited code=${code} signal=${signal}`);
+    backendProcess = null;
+  });
+
+  for (let i = 0; i < 8; i++) {
+    await wait(250);
+  }
+  log(`Backend ready at http://${host}:${port}`);
 }
 
 function stopBackend() {
@@ -484,10 +476,11 @@ function stopBackend() {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 560,
-    height: 44,
+    width: 1280,
+    height: 860,
     minWidth: 1200,
     minHeight: 760,
+    show: false,
     autoHideMenuBar: true,
     backgroundColor: "#0f172a",
     webPreferences: {
@@ -504,6 +497,13 @@ function createWindow() {
   } else {
     mainWindow.loadFile(getRendererFile());
   }
+
+  mainWindow.once('ready-to-show', () => {
+    if (!mainWindow) return;
+    mainWindow.show();
+    mainWindow.setBounds({ width: 1280, height: 860, x: undefined, y: undefined });
+    mainWindow.center();
+  });
 
   mainWindow.on("closed", () => {
     mainWindow = null;
@@ -590,14 +590,23 @@ async function composeFinalMediaFiles(payload = {}) {
   await renderCustomBarsVideo(finalAudioPath, barsVideo, audioDuration, {
     width: 560,
     height: 44,
-    fps: 10,
-    barCount: 48,
-    barWidth: 5,
-    gap: 7,
-    bottomPadding: 3,
-    minBarHeight: 3,
-    historySeconds: 2.5,
-    smoothWindowMs: 120
+    fps: 24,
+    barCount: 84,
+    barWidth: 4,
+    gap: 0,
+    bottomPadding: 2,
+    minBarHeight: 4,
+    maxBarHeight: 30,
+    idleMin: 4,
+    idleMax: 10,
+    speakingBoost: 3.15,
+    activeSpan: 9,
+    spreadBias: 0.82,
+    smoothingUp: 0.26,
+    smoothingDown: 0.20,
+    borderRadius: 9999,
+    historySeconds: 2.2,
+    smoothWindowMs: 92
   });
 
   const step1 = [

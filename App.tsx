@@ -700,7 +700,6 @@ const handleSelectWaveAudio = async () => {
 
     setWaveAudioPath(result.path);
 
-    // 👉 FIX CHÍNH: đọc file qua electron -> tạo blob
     const readResult = await window.electronAPI?.readAudioFile?.({
       filePath: result.path
     });
@@ -720,6 +719,12 @@ const handleSelectWaveAudio = async () => {
       type: readResult.mimeType || "audio/wav"
     });
 
+    if (waveAudioUrl) {
+      try {
+        URL.revokeObjectURL(waveAudioUrl);
+      } catch {}
+    }
+
     const url = URL.createObjectURL(blob);
     setWaveAudioUrl(url);
     setIsWaveReady(true);
@@ -734,7 +739,8 @@ const handleSelectWaveAudio = async () => {
       setWaveStatus("Audio đã sẵn sàng để dựng video.");
     }
 
-    setIsWavePanelOpen(true);
+    // Không ép mở lại panel sau khi đã chọn audio xong.
+    // Điều này giúp bảng chọn không bị giữ mở / phải đóng tay lần nữa.
   } catch (error: any) {
     setWaveError(error?.message || "Không chọn được file audio");
   }
