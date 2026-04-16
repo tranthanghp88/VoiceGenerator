@@ -1,7 +1,7 @@
 {
     "name":  "english-voice-generator",
     "private":  true,
-    "version":  "2.0.0",
+    "version":  "2.0.1",
     "description":  "Voice Generator",
     "main":  "electron/main.cjs",
     "type":  "module",
@@ -111,6 +111,10 @@
                                "createStartMenuShortcut":  true,
                                "shortcutName":  "English Voice Generator",
                                "artifactName":  "${productName}-Setup-${version}.${ext}"
-                           }
+                           },
+                  "asarUnpack":  [
+                                     "server/**/*",
+                                     "electron/**/*"
+                                 ]
               }
 }

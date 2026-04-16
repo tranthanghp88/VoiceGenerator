@@ -57,7 +57,14 @@ function getProjectRoot() {
 }
 
 function getPreloadPath() {
-  return path.join(__dirname, "preload.cjs");
+  const appPath = typeof app.getAppPath === "function" ? app.getAppPath() : "";
+  const candidates = [
+    path.join(__dirname, "preload.cjs"),
+    path.join(appPath, "electron", "preload.cjs"),
+    path.join(process.resourcesPath || "", "app.asar.unpacked", "electron", "preload.cjs"),
+    path.join(process.resourcesPath || "", "electron", "preload.cjs")
+  ].filter(Boolean);
+  return candidates.find((p) => fs.existsSync(p)) || candidates[0];
 }
 
 function getRendererUrl() {
@@ -65,11 +72,25 @@ function getRendererUrl() {
 }
 
 function getRendererFile() {
-  return path.join(getProjectRoot(), "dist", "index.html");
+  const appPath = typeof app.getAppPath === "function" ? app.getAppPath() : "";
+  const candidates = [
+    path.join(getProjectRoot(), "dist", "index.html"),
+    path.join(appPath, "dist", "index.html"),
+    path.join(process.resourcesPath || "", "app.asar.unpacked", "dist", "index.html"),
+    path.join(process.resourcesPath || "", "dist", "index.html")
+  ].filter(Boolean);
+  return candidates.find((p) => fs.existsSync(p)) || candidates[0];
 }
 
 function getServerEntry() {
-  return path.join(getProjectRoot(), "server", "index.mjs");
+  const appPath = typeof app.getAppPath === "function" ? app.getAppPath() : "";
+  const candidates = [
+    path.join(getProjectRoot(), "server", "index.mjs"),
+    path.join(appPath, "server", "index.mjs"),
+    path.join(process.resourcesPath || "", "app.asar.unpacked", "server", "index.mjs"),
+    path.join(process.resourcesPath || "", "server", "index.mjs")
+  ].filter(Boolean);
+  return candidates.find((p) => fs.existsSync(p)) || candidates[0];
 }
 
 function ensureNumber(value, fallback = 0) {
@@ -515,7 +536,9 @@ async function startBackend() {
     }
 
     const serverEntry = getServerEntry();
-    if (!fs.existsSync(serverEntry)) {
+    log(`resolved serverEntry = ${serverEntry}`);
+    log(`serverEntry exists = ${String(!!serverEntry && fs.existsSync(serverEntry))}`);
+    if (!serverEntry || !fs.existsSync(serverEntry)) {
       log(`server entry not found: ${serverEntry}`);
       return;
     }
@@ -527,7 +550,7 @@ async function startBackend() {
     log(`serverEntry = ${serverEntry}`);
 
     backendProcess = spawn(process.execPath, [serverEntry], {
-      cwd: getProjectRoot(),
+      cwd: path.dirname(serverEntry),
       env: {
         ...process.env,
         PORT: process.env.PORT || "3030",
@@ -559,7 +582,7 @@ async function startBackend() {
       backendProcess = null;
     });
 
-    const ready = await waitForBackendApi(host, port, 24, 250);
+    const ready = await waitForBackendApi(host, port, 40, 250);
     if (ready) {
       log(`Backend ready at http://${host}:${port}`);
       return;
